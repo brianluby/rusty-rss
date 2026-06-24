@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:media="http://search.yahoo.com/mrss/">
+  <title>Saved - geek_404</title>
+  <link href="https://www.reddit.com/saved.rss" rel="self"/>
+  <id>https://www.reddit.com/saved.rss</id>
+  <updated>2026-06-24T10:00:00Z</updated>
+
+  <entry>
+    <id>t3_abc123</id>
+    <title>Rust 1.96 Released</title>
+    <link href="https://www.reddit.com/r/rust/comments/abc123/rust_196_released/" rel="alternate"/>
+    <author>
+      <name>rust_lang</name>
+    </author>
+    <category term="rust"/>
+    <published>2026-06-23T12:00:00Z</published>
+    <updated>2026-06-23T14:00:00Z</updated>
+    <content type="html">&lt;a href=&quot;https://blog.rust-lang.org/1.96.0/&quot;&gt;https://blog.rust-lang.org/1.96.0/&lt;/a&gt;
+
+Rust 1.96 is here with exciting new features.</content>
+    <media:thumbnail url="https://preview.redd.it/abc123.png?auto=webp&amp;s=xyz"/>
+  </entry>
+
+  <entry>
+    <id>t3_def456</id>
+    <title>Effective Go</title>
+    <link href="https://www.reddit.com/r/golang/comments/def456/effective_go/" rel="alternate"/>
+    <author>
+      <name>gopher_dev</name>
+    </author>
+    <category term="golang"/>
+    <published>2026-06-22T08:00:00Z</published>
+    <updated>2026-06-22T08:00:00Z</updated>
+    <content type="html">&lt;a href=&quot;https://go.dev/doc/effective_go&quot;&gt;https://go.dev/doc/effective_go&lt;/a&gt;</content>
+  </entry>
+
+  <entry>
+    <id>t3_ghi789</id>
+    <title>Self-post without outbound link</title>
+    <link href="https://www.reddit.com/r/programming/comments/ghi789/self_post/" rel="alternate"/>
+    <author>
+      <name>selfposter</name>
+    </author>
+    <category term="programming"/>
+    <published>2026-06-21T00:00:00Z</published>
+    <updated>2026-06-21T00:00:00Z</updated>
+    <content type="html">This is a self-post with no external link.</content>
+  </entry>
+</feed>
