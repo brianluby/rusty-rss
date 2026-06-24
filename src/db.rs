@@ -18,7 +18,7 @@ pub fn init_db(db_path: &Path) -> Result<Connection> {
             subreddit TEXT,
             permalink TEXT NOT NULL,
             outbound_url TEXT,
-            content_html TEXT,
+            content_markdown TEXT,
             thumbnail_url TEXT,
             published_at TEXT,
             updated_at TEXT,
@@ -48,7 +48,60 @@ pub fn init_db(db_path: &Path) -> Result<Connection> {
     )
     .context("failed to initialize database schema")?;
 
+    ensure_column(&conn, "saved_posts", "content_markdown", "TEXT")?;
+    migrate_content_html_to_markdown(&conn)?;
+
     Ok(conn)
+}
+
+fn ensure_column(conn: &Connection, table: &str, column: &str, column_type: &str) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    if !columns.iter().any(|name| name == column) {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {column_type}"),
+            [],
+        )
+        .context(format!("failed to add {table}.{column}"))?;
+    }
+
+    Ok(())
+}
+
+fn migrate_content_html_to_markdown(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(saved_posts)")?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    if !columns.iter().any(|name| name == "content_html") {
+        return Ok(());
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT reddit_fullname, content_html FROM saved_posts
+         WHERE content_markdown IS NULL AND content_html IS NOT NULL",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(stmt);
+
+    for (fullname, html) in rows {
+        let markdown = html2md::parse_html(&html).trim().to_string();
+        conn.execute(
+            "UPDATE saved_posts SET content_markdown = ? WHERE reddit_fullname = ?",
+            params![markdown, fullname],
+        )
+        .context("failed to migrate content_html to content_markdown")?;
+    }
+
+    Ok(())
 }
 
 pub fn upsert_post(conn: &Connection, post: &SavedPost) -> Result<UpsertResult> {
@@ -57,7 +110,7 @@ pub fn upsert_post(conn: &Connection, post: &SavedPost) -> Result<UpsertResult> 
     let existing = conn
         .query_row(
             "SELECT reddit_id, title, author, subreddit, permalink, outbound_url,
-                    content_html, thumbnail_url, published_at, updated_at, source
+                    content_markdown, thumbnail_url, published_at, updated_at, source
              FROM saved_posts WHERE reddit_fullname = ?",
             params![post.reddit_fullname],
             ExistingPost::from_row,
@@ -69,7 +122,7 @@ pub fn upsert_post(conn: &Connection, post: &SavedPost) -> Result<UpsertResult> 
         conn.execute(
             r#"INSERT INTO saved_posts (
                 reddit_fullname, reddit_id, title, author, subreddit,
-                permalink, outbound_url, content_html, thumbnail_url,
+                permalink, outbound_url, content_markdown, thumbnail_url,
                 published_at, updated_at, first_seen_at, last_seen_at, source
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
             params![
@@ -80,7 +133,7 @@ pub fn upsert_post(conn: &Connection, post: &SavedPost) -> Result<UpsertResult> 
                 post.subreddit,
                 post.permalink,
                 post.outbound_url,
-                post.content_html,
+                post.content_markdown,
                 post.thumbnail_url,
                 post.published_at.as_ref().map(|d| d.to_rfc3339()),
                 post.updated_at.as_ref().map(|d| d.to_rfc3339()),
@@ -102,7 +155,7 @@ pub fn upsert_post(conn: &Connection, post: &SavedPost) -> Result<UpsertResult> 
         conn.execute(
             r#"UPDATE saved_posts SET
                 reddit_id = ?, title = ?, author = ?, subreddit = ?, permalink = ?,
-                outbound_url = ?, content_html = ?, thumbnail_url = ?,
+                outbound_url = ?, content_markdown = ?, thumbnail_url = ?,
                 published_at = ?, updated_at = ?, last_seen_at = ?, source = ?
             WHERE reddit_fullname = ?"#,
             params![
@@ -112,7 +165,7 @@ pub fn upsert_post(conn: &Connection, post: &SavedPost) -> Result<UpsertResult> 
                 post.subreddit,
                 post.permalink,
                 post.outbound_url,
-                post.content_html,
+                post.content_markdown,
                 post.thumbnail_url,
                 post.published_at.as_ref().map(|d| d.to_rfc3339()),
                 post.updated_at.as_ref().map(|d| d.to_rfc3339()),
@@ -143,7 +196,7 @@ struct ExistingPost {
     subreddit: Option<String>,
     permalink: String,
     outbound_url: Option<String>,
-    content_html: Option<String>,
+    content_markdown: Option<String>,
     thumbnail_url: Option<String>,
     published_at: Option<String>,
     updated_at: Option<String>,
@@ -159,7 +212,7 @@ impl ExistingPost {
             subreddit: row.get(3)?,
             permalink: row.get(4)?,
             outbound_url: row.get(5)?,
-            content_html: row.get(6)?,
+            content_markdown: row.get(6)?,
             thumbnail_url: row.get(7)?,
             published_at: row.get(8)?,
             updated_at: row.get(9)?,
@@ -174,7 +227,7 @@ impl ExistingPost {
             || self.subreddit != post.subreddit
             || self.permalink != post.permalink
             || self.outbound_url != post.outbound_url
-            || self.content_html != post.content_html
+            || self.content_markdown != post.content_markdown
             || self.thumbnail_url != post.thumbnail_url
             || self.published_at != post.published_at.as_ref().map(|date| date.to_rfc3339())
             || self.updated_at != post.updated_at.as_ref().map(|date| date.to_rfc3339())
@@ -230,7 +283,7 @@ pub fn get_post(conn: &Connection, fullname: &str) -> Result<Option<SavedPost>> 
     let row = conn
         .query_row(
             "SELECT reddit_fullname, reddit_id, title, author, subreddit, permalink,
-                    outbound_url, content_html, thumbnail_url, published_at, updated_at,
+                    outbound_url, content_markdown, thumbnail_url, published_at, updated_at,
                     first_seen_at, last_seen_at, source
              FROM saved_posts WHERE reddit_fullname = ?",
             params![fullname],
@@ -243,7 +296,7 @@ pub fn get_post(conn: &Connection, fullname: &str) -> Result<Option<SavedPost>> 
                     subreddit: row.get(4)?,
                     permalink: row.get(5)?,
                     outbound_url: row.get(6)?,
-                    content_html: row.get(7)?,
+                    content_markdown: row.get(7)?,
                     thumbnail_url: row.get(8)?,
                     published_at: row.get::<_, Option<String>>(9)?.and_then(|s| {
                         chrono::DateTime::parse_from_rfc3339(&s)
@@ -301,6 +354,7 @@ mod tests {
         post.author = Some("testuser".to_string());
         post.subreddit = Some("test".to_string());
         post.published_at = Some(Utc::now());
+        post.content_markdown = Some("Test markdown".to_string());
         post
     }
 
@@ -335,6 +389,25 @@ mod tests {
             .expect("get should succeed")
             .expect("post should exist");
         assert_eq!(fetched.title, "Updated Title");
+    }
+
+    #[test]
+    fn upsert_updates_existing_markdown_content() {
+        let conn = test_db();
+        let mut post = test_post();
+        upsert_post(&conn, &post).expect("first upsert should succeed");
+
+        post.content_markdown = Some("Updated markdown".to_string());
+        let result = upsert_post(&conn, &post).expect("second upsert should succeed");
+
+        assert!(matches!(result, UpsertResult::Updated));
+        let fetched = get_post(&conn, "t3_test123")
+            .expect("get should succeed")
+            .expect("post should exist");
+        assert_eq!(
+            fetched.content_markdown,
+            Some("Updated markdown".to_string())
+        );
     }
 
     #[test]
@@ -396,5 +469,68 @@ mod tests {
 
         let count = count_posts(&conn).expect("count should succeed");
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn init_db_adds_markdown_column_to_existing_schema() {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "rusty_rss_migration_test_{}_{}.db",
+            std::process::id(),
+            id
+        ));
+        let conn = Connection::open(&path).expect("db should open");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE saved_posts (
+                reddit_fullname TEXT PRIMARY KEY,
+                reddit_id TEXT,
+                title TEXT NOT NULL,
+                author TEXT,
+                subreddit TEXT,
+                permalink TEXT NOT NULL,
+                outbound_url TEXT,
+                content_html TEXT,
+                thumbnail_url TEXT,
+                published_at TEXT,
+                updated_at TEXT,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'atom',
+                raw_entry TEXT
+            );
+            INSERT INTO saved_posts (
+                reddit_fullname, reddit_id, title, permalink, content_html,
+                first_seen_at, last_seen_at, source
+            ) VALUES (
+                't3_old', 'old', 'Old Post', 'https://reddit.com/r/rust/comments/old/',
+                '<p>Hello <strong>Markdown</strong></p>',
+                '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'atom'
+            );
+            "#,
+        )
+        .expect("old schema should be created");
+        drop(conn);
+
+        let conn = init_db(&path).expect("init should migrate schema");
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(saved_posts)")
+            .expect("pragma should prepare");
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("columns should query")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("columns should collect");
+
+        assert!(columns.contains(&"content_markdown".to_string()));
+
+        let migrated: String = conn
+            .query_row(
+                "SELECT content_markdown FROM saved_posts WHERE reddit_fullname = 't3_old'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("migrated markdown should exist");
+        assert_eq!(migrated, "Hello **Markdown**");
     }
 }

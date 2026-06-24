@@ -30,7 +30,7 @@ The feed URL is required for `sync` via env var or `--feed-url`.
 
 ## Database Schema
 
-- `saved_posts` — Posts keyed by `reddit_fullname` with title, author, subreddit, permalink, content, timestamps.
+- `saved_posts` — Posts keyed by `reddit_fullname` with title, author, subreddit, permalink, Markdown content, timestamps.
 - `sync_runs` — History of sync operations with status and counts.
 
 ## Build

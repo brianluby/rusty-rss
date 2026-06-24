@@ -69,10 +69,11 @@ fn parse_entry(entry: feed_rs::model::Entry) -> Result<SavedPost> {
     post.published_at = entry.published;
     post.updated_at = entry.updated;
 
-    post.content_html = entry
+    post.content_markdown = entry
         .content
         .as_ref()
-        .and_then(|content| content.body.clone())
+        .and_then(|content| content.body.as_deref())
+        .map(html_to_markdown)
         .filter(|body| !body.trim().is_empty());
 
     post.thumbnail_url = extract_thumbnail(&entry);
@@ -105,6 +106,10 @@ fn extract_thumbnail(entry: &feed_rs::model::Entry) -> Option<String> {
                 .map(|link| link.href.trim().to_string())
                 .filter(|href| !href.is_empty())
         })
+}
+
+fn html_to_markdown(html: &str) -> String {
+    html2md::parse_html(html).trim().to_string()
 }
 
 fn extract_outbound_url(entry: &feed_rs::model::Entry) -> Option<String> {
@@ -233,6 +238,34 @@ mod tests {
             Some("https://go.dev/doc/effective_go".to_string())
         );
         assert!(posts[2].outbound_url.is_none());
+    }
+
+    #[test]
+    fn converts_html_content_to_markdown() {
+        let posts = parse_fixture_posts();
+
+        assert_eq!(
+            posts[0].content_markdown,
+            Some("[https://blog.rust-lang.org/1.96.0/](https://blog.rust-lang.org/1.96.0/) Rust 1.96 is here with exciting new features.".to_string())
+        );
+        assert_eq!(
+            posts[1].content_markdown,
+            Some(
+                "[https://go.dev/doc/effective\\_go](https://go.dev/doc/effective_go)".to_string()
+            )
+        );
+        assert_eq!(
+            posts[2].content_markdown,
+            Some("This is a self-post with no external link.".to_string())
+        );
+    }
+
+    #[test]
+    fn converts_basic_html_formatting_to_markdown() {
+        assert_eq!(
+            html_to_markdown("<p>Hello <strong>Rust</strong></p>"),
+            "Hello **Rust**"
+        );
     }
 
     #[test]

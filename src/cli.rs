@@ -141,8 +141,8 @@ fn run_show(db_path: PathBuf, fullname: String) -> Result<()> {
             if let Some(ts) = &post.published_at {
                 println!("Published: {}", ts.to_rfc3339());
             }
-            if let Some(html) = &post.content_html {
-                println!("\nContent:\n{}", html.trim());
+            if let Some(markdown) = &post.content_markdown {
+                println!("\nContent:\n{}", markdown.trim());
             }
         }
         None => {
@@ -182,7 +182,7 @@ mod tests {
         );
         post.author = Some("cli_user".to_string());
         post.subreddit = Some("rust".to_string());
-        post.content_html = Some("<p>content</p>".to_string());
+        post.content_markdown = Some("content".to_string());
         db::upsert_post(&conn, &post).expect("post should insert");
     }
 
