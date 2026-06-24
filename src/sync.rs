@@ -105,3 +105,144 @@ fn record_sync_end(
     )?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn test_db_path() -> PathBuf {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "rusty_rss_sync_test_{}_{}.db",
+            std::process::id(),
+            id
+        ))
+    }
+
+    fn serve_feed(body: String) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("server should bind");
+        let addr = listener.local_addr().expect("local address should exist");
+
+        std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("server should accept request");
+                let mut request = [0u8; 2048];
+                let _ = stream
+                    .read(&mut request)
+                    .expect("request should be readable");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/atom+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("response should be written");
+            }
+        });
+
+        format!("http://{addr}/feed")
+    }
+
+    fn config_for(feed_url: String, db_path: PathBuf) -> Config {
+        Config {
+            feed_url,
+            db_path,
+            user_agent: "rusty-rss-test/1.0".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_sync_inserts_then_reports_unchanged() {
+        let feed =
+            std::fs::read_to_string("test-fixtures/atom-feed.xml").expect("fixture should exist");
+        let db_path = test_db_path();
+        let config = config_for(serve_feed(feed), db_path.clone());
+
+        let first = run_sync(&config).await.expect("first sync should succeed");
+        let second = run_sync(&config).await.expect("second sync should succeed");
+
+        assert_eq!(first.fetched_count, 3);
+        assert_eq!(first.inserted_count, 3);
+        assert_eq!(first.updated_count, 0);
+        assert_eq!(first.unchanged_count, 0);
+        assert!(first.parse_errors.is_empty());
+
+        assert_eq!(second.fetched_count, 3);
+        assert_eq!(second.inserted_count, 0);
+        assert_eq!(second.updated_count, 0);
+        assert_eq!(second.unchanged_count, 3);
+
+        let conn = db::init_db(&db_path).expect("db should open");
+        let count = db::count_posts(&conn).expect("count should work");
+        assert_eq!(count, 3);
+    }
+
+    #[tokio::test]
+    async fn run_sync_returns_entry_parse_errors() {
+        let feed = r#"<?xml version="1.0"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Invalid</title>
+  <link href="https://example.com" rel="self"/>
+  <id>tag:example,2026:invalid</id>
+  <updated>2026-01-01T00:00:00Z</updated>
+  <entry>
+    <id>t3_valid</id>
+    <title>Valid</title>
+    <link href="https://www.reddit.com/r/rust/comments/valid/" rel="alternate"/>
+    <updated>2026-01-01T00:00:00Z</updated>
+  </entry>
+  <entry>
+    <id>t3_invalid</id>
+    <link href="https://www.reddit.com/r/rust/comments/invalid/" rel="alternate"/>
+    <updated>2026-01-01T00:00:00Z</updated>
+  </entry>
+</feed>"#;
+
+        let db_path = test_db_path();
+        let config = config_for(serve_feed(feed.to_string()), db_path);
+
+        let result = run_sync(&config).await.expect("sync should succeed");
+
+        assert_eq!(result.fetched_count, 2);
+        assert_eq!(result.inserted_count, 1);
+        assert_eq!(result.parse_errors.len(), 1);
+        assert!(result.parse_errors[0].contains("missing entry/title"));
+    }
+
+    #[test]
+    fn records_failed_sync_end() {
+        let db_path = test_db_path();
+        let now = Utc::now();
+        let run_id = record_sync_start(&db_path, "https://example.com/feed", &now)
+            .expect("sync start should be recorded");
+
+        record_sync_end(&db_path, run_id, "error", 0, 0, 0, Some("boom"))
+            .expect("sync end should be recorded");
+
+        let conn = db::init_db(&db_path).expect("db should open");
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM sync_runs WHERE id = ?",
+                [run_id],
+                |row| row.get(0),
+            )
+            .expect("status should exist");
+        let error: String = conn
+            .query_row(
+                "SELECT error FROM sync_runs WHERE id = ?",
+                [run_id],
+                |row| row.get(0),
+            )
+            .expect("error should exist");
+
+        assert_eq!(status, "error");
+        assert_eq!(error, "boom");
+    }
+}

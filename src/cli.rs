@@ -54,7 +54,8 @@ pub async fn run(cli: Cli) -> Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
-        .init();
+        .try_init()
+        .ok();
 
     match cli.command {
         Command::Sync => {
@@ -151,4 +152,75 @@ fn run_show(db_path: PathBuf, fullname: String) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db;
+    use crate::models::SavedPost;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn test_db_path() -> PathBuf {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "rusty_rss_cli_test_{}_{}.db",
+            std::process::id(),
+            id
+        ))
+    }
+
+    fn insert_post(db_path: &std::path::Path) {
+        let conn = db::init_db(db_path).expect("db should initialize");
+        let mut post = SavedPost::new(
+            "t3_cli123".to_string(),
+            "CLI Test Post".to_string(),
+            "https://www.reddit.com/r/rust/comments/cli123/test/".to_string(),
+            "atom".to_string(),
+        );
+        post.author = Some("cli_user".to_string());
+        post.subreddit = Some("rust".to_string());
+        post.content_html = Some("<p>content</p>".to_string());
+        db::upsert_post(&conn, &post).expect("post should insert");
+    }
+
+    #[test]
+    fn list_empty_database_returns_ok_without_feed_url() {
+        let db_path = test_db_path();
+
+        run_list(db_path, 20, 0).expect("list should not require feed URL");
+    }
+
+    #[test]
+    fn list_populated_database_returns_ok() {
+        let db_path = test_db_path();
+        insert_post(&db_path);
+
+        run_list(db_path, 20, 0).expect("list should succeed");
+    }
+
+    #[test]
+    fn show_existing_post_returns_ok() {
+        let db_path = test_db_path();
+        insert_post(&db_path);
+
+        run_show(db_path, "t3_cli123".to_string()).expect("show should succeed");
+    }
+
+    #[tokio::test]
+    async fn run_list_command_does_not_require_feed_url() {
+        let db_path = test_db_path();
+        let cli = Cli {
+            command: Command::List {
+                limit: 10,
+                offset: 0,
+            },
+            feed_url: None,
+            db_path: db_path.to_string_lossy().to_string(),
+        };
+
+        run(cli).await.expect("list command should succeed");
+    }
 }

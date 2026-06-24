@@ -38,3 +38,43 @@ impl Config {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builds_config_from_overrides() {
+        let config = Config::from_env_and_overrides(
+            Some("https://old.reddit.com/saved.rss?feed=token&user=user".to_string()),
+            Some("./test.sqlite3".to_string()),
+        )
+        .expect("config should build");
+
+        assert_eq!(
+            config.feed_url,
+            "https://old.reddit.com/saved.rss?feed=token&user=user"
+        );
+        assert_eq!(config.db_path, PathBuf::from("./test.sqlite3"));
+        assert_eq!(config.user_agent, DEFAULT_USER_AGENT);
+    }
+
+    #[test]
+    fn uses_default_db_path_when_not_overridden() {
+        let config = Config::from_env_and_overrides(
+            Some("https://old.reddit.com/saved.rss?feed=token&user=user".to_string()),
+            None,
+        )
+        .expect("config should build");
+
+        assert_eq!(config.db_path, PathBuf::from(DEFAULT_DB_PATH));
+    }
+
+    #[test]
+    fn rejects_invalid_feed_url() {
+        let err = Config::from_env_and_overrides(Some("not a url".to_string()), None)
+            .expect_err("invalid URL should fail");
+
+        assert!(err.to_string().contains("feed URL is not a valid URL"));
+    }
+}
