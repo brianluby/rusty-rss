@@ -6,6 +6,7 @@ use crate::parse;
 use anyhow::Result;
 use chrono::Utc;
 use rusqlite::params;
+use std::collections::HashSet;
 
 pub async fn run_sync(config: &Config) -> Result<SyncResult> {
     let client = fetch::build_http_client(&config.user_agent);
@@ -44,28 +45,78 @@ pub async fn run_sync(config: &Config) -> Result<SyncResult> {
 }
 
 async fn do_sync(client: &reqwest::Client, config: &Config) -> Result<SyncResult> {
-    let body = fetch::fetch_feed(client, &config.feed_url).await?;
-    let parsed = parse::parse_atom(&body)?;
-
     let conn = db::init_db(&config.db_path)?;
     let mut result = SyncResult::new();
-    result.fetched_count = parsed.posts.len() + parsed.errors.len();
-    result.parse_errors = parsed.errors;
+    let mut after = None;
+    let mut seen_ids = HashSet::new();
 
-    for post in &parsed.posts {
-        match db::upsert_post(&conn, post) {
-            Ok(UpsertResult::Inserted) => result.inserted_count += 1,
-            Ok(UpsertResult::Updated) => result.updated_count += 1,
-            Ok(UpsertResult::Unchanged) => result.unchanged_count += 1,
-            Err(e) => {
-                result
-                    .parse_errors
-                    .push(format!("failed to upsert {}: {}", post.reddit_fullname, e));
+    for page_index in 0..config.max_pages {
+        let page_url = paginated_url(
+            &config.feed_url,
+            config.sync_limit,
+            after.as_deref(),
+            seen_ids.len(),
+        )?;
+        let body = fetch::fetch_feed(client, &page_url).await?;
+        let parsed = parse::parse_atom(&body)?;
+        let entry_count = parsed.entry_count;
+        let last_entry_id = parsed.last_entry_id.clone();
+        let mut page_new_ids = 0;
+
+        result.page_count += 1;
+        result.fetched_count += parsed.entry_count;
+        result.parse_errors.extend(parsed.errors);
+
+        for post in &parsed.posts {
+            if seen_ids.insert(post.reddit_fullname.clone()) {
+                page_new_ids += 1;
             }
+
+            match db::upsert_post(&conn, post) {
+                Ok(UpsertResult::Inserted) => result.inserted_count += 1,
+                Ok(UpsertResult::Updated) => result.updated_count += 1,
+                Ok(UpsertResult::Unchanged) => result.unchanged_count += 1,
+                Err(e) => {
+                    result
+                        .parse_errors
+                        .push(format!("failed to upsert {}: {}", post.reddit_fullname, e));
+                }
+            }
+        }
+
+        if entry_count < config.sync_limit || page_new_ids == 0 || last_entry_id.is_none() {
+            break;
+        }
+
+        after = last_entry_id;
+
+        if page_index + 1 == config.max_pages {
+            tracing::info!(
+                max_pages = config.max_pages,
+                "stopped sync at max page limit"
+            );
         }
     }
 
     Ok(result)
+}
+
+fn paginated_url(
+    base_url: &str,
+    limit: usize,
+    after: Option<&str>,
+    count: usize,
+) -> Result<String> {
+    let mut url = url::Url::parse(base_url)?;
+    {
+        let mut query = url.query_pairs_mut();
+        query.append_pair("limit", &limit.max(1).to_string());
+        if let Some(after) = after.filter(|value| !value.is_empty()) {
+            query.append_pair("after", after);
+            query.append_pair("count", &count.to_string());
+        }
+    }
+    Ok(url.to_string())
 }
 
 fn record_sync_start(
@@ -155,7 +206,66 @@ mod tests {
             feed_url,
             db_path,
             user_agent: "rusty-rss-test/1.0".to_string(),
+            sync_limit: 100,
+            max_pages: 50,
         }
+    }
+
+    fn paged_feed(entries: &[&str]) -> String {
+        let entries = entries
+            .iter()
+            .map(|id| {
+                format!(
+                    r#"<entry>
+    <id>{id}</id>
+    <title>Saved item {id}</title>
+    <link href="https://www.reddit.com/r/rust/comments/{id}/saved_item/" rel="alternate"/>
+    <updated>2026-01-01T00:00:00Z</updated>
+  </entry>"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        format!(
+            r#"<?xml version="1.0"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Saved</title>
+  <link href="https://example.com" rel="self"/>
+  <id>tag:example,2026:saved</id>
+  <updated>2026-01-01T00:00:00Z</updated>
+  {entries}
+</feed>"#
+        )
+    }
+
+    fn serve_paginated_feeds(pages: Vec<String>) -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("server should bind");
+        let addr = listener.local_addr().expect("local address should exist");
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move || {
+            for body in pages {
+                let (mut stream, _) = listener.accept().expect("server should accept request");
+                let mut request = [0u8; 4096];
+                let read = stream
+                    .read(&mut request)
+                    .expect("request should be readable");
+                tx.send(String::from_utf8_lossy(&request[..read]).to_string())
+                    .expect("request should be sent to test");
+
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/atom+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("response should be written");
+            }
+        });
+
+        (format!("http://{addr}/feed?feed=token&user=user"), rx)
     }
 
     #[tokio::test]
@@ -169,12 +279,14 @@ mod tests {
         let second = run_sync(&config).await.expect("second sync should succeed");
 
         assert_eq!(first.fetched_count, 3);
+        assert_eq!(first.page_count, 1);
         assert_eq!(first.inserted_count, 3);
         assert_eq!(first.updated_count, 0);
         assert_eq!(first.unchanged_count, 0);
         assert!(first.parse_errors.is_empty());
 
         assert_eq!(second.fetched_count, 3);
+        assert_eq!(second.page_count, 1);
         assert_eq!(second.inserted_count, 0);
         assert_eq!(second.updated_count, 0);
         assert_eq!(second.unchanged_count, 3);
@@ -211,6 +323,7 @@ mod tests {
         let result = run_sync(&config).await.expect("sync should succeed");
 
         assert_eq!(result.fetched_count, 2);
+        assert_eq!(result.page_count, 1);
         assert_eq!(result.inserted_count, 1);
         assert_eq!(result.parse_errors.len(), 1);
         assert!(result.parse_errors[0].contains("missing entry/title"));
@@ -244,5 +357,60 @@ mod tests {
 
         assert_eq!(status, "error");
         assert_eq!(error, "boom");
+    }
+
+    #[tokio::test]
+    async fn run_sync_fetches_paginated_feeds() {
+        let db_path = test_db_path();
+        let (feed_url, requests) = serve_paginated_feeds(vec![
+            paged_feed(&["t3_page1a", "t3_page1b"]),
+            paged_feed(&["t3_page2a", "t1_comment2b"]),
+            paged_feed(&["t3_page3a"]),
+        ]);
+        let mut config = config_for(feed_url, db_path.clone());
+        config.sync_limit = 2;
+        config.max_pages = 10;
+
+        let result = run_sync(&config).await.expect("sync should succeed");
+
+        assert_eq!(result.page_count, 3);
+        assert_eq!(result.fetched_count, 5);
+        assert_eq!(result.inserted_count, 5);
+        assert!(result.parse_errors.is_empty());
+
+        let first_request = requests.recv().expect("first request should be captured");
+        let second_request = requests.recv().expect("second request should be captured");
+        let third_request = requests.recv().expect("third request should be captured");
+
+        assert!(first_request.contains("limit=2"));
+        assert!(!first_request.contains("after="));
+        assert!(second_request.contains("limit=2"));
+        assert!(second_request.contains("after=t3_page1b"));
+        assert!(second_request.contains("count=2"));
+        assert!(third_request.contains("after=t1_comment2b"));
+        assert!(third_request.contains("count=4"));
+
+        let conn = db::init_db(&db_path).expect("db should open");
+        let comment = db::get_post(&conn, "t1_comment2b")
+            .expect("comment query should succeed")
+            .expect("comment should exist");
+        assert_eq!(comment.reddit_id, "comment2b");
+    }
+
+    #[test]
+    fn paginated_url_preserves_existing_query_and_adds_paging_params() {
+        let url = paginated_url(
+            "https://old.reddit.com/saved.rss?feed=token&user=user",
+            100,
+            Some("t3_last"),
+            100,
+        )
+        .expect("url should build");
+
+        assert!(url.contains("feed=token"));
+        assert!(url.contains("user=user"));
+        assert!(url.contains("limit=100"));
+        assert!(url.contains("after=t3_last"));
+        assert!(url.contains("count=100"));
     }
 }

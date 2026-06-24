@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::{Config, DEFAULT_MAX_PAGES, DEFAULT_SYNC_LIMIT};
 use crate::db;
 use crate::sync;
 use anyhow::Result;
@@ -30,7 +30,15 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Command {
     /// Fetch the Atom feed and sync saved posts into the database
-    Sync,
+    Sync {
+        /// Number of saved items to request per Reddit page
+        #[arg(long, default_value_t = DEFAULT_SYNC_LIMIT)]
+        limit: usize,
+
+        /// Maximum number of Reddit pages to fetch
+        #[arg(long, default_value_t = DEFAULT_MAX_PAGES)]
+        max_pages: usize,
+    },
     /// List saved posts
     List {
         /// Number of posts to show
@@ -58,8 +66,9 @@ pub async fn run(cli: Cli) -> Result<()> {
         .ok();
 
     match cli.command {
-        Command::Sync => {
-            let config = Config::from_env_and_overrides(cli.feed_url, Some(cli.db_path))?;
+        Command::Sync { limit, max_pages } => {
+            let config =
+                Config::from_env_and_overrides(cli.feed_url, Some(cli.db_path), limit, max_pages)?;
             run_sync(config).await
         }
         Command::List { limit, offset } => run_list(PathBuf::from(cli.db_path), limit, offset),
@@ -71,7 +80,8 @@ async fn run_sync(config: Config) -> Result<()> {
     let result = sync::run_sync(&config).await?;
 
     println!(
-        "Sync complete: {} fetched, {} inserted, {} updated, {} unchanged, {} errors",
+        "Sync complete: {} pages, {} fetched, {} inserted, {} updated, {} unchanged, {} errors",
+        result.page_count,
         result.fetched_count,
         result.inserted_count,
         result.updated_count,

@@ -12,6 +12,12 @@ rusty-rss list --limit 50
 rusty-rss show t3_abc123
 ```
 
+By default, `sync` requests up to `100` saved items per Reddit page and follows up to `50` pages:
+
+```bash
+rusty-rss sync --limit 100 --max-pages 50
+```
+
 ## Configuration
 
 | Variable | Flag | Default | Description |
@@ -24,7 +30,7 @@ The feed URL is required for `sync` via env var or `--feed-url`.
 
 ## Commands
 
-- **sync** — Fetch the Atom feed and upsert saved posts into SQLite. Idempotent: safe to run repeatedly.
+- **sync** — Fetch paginated Atom feed pages and upsert saved items into SQLite. Idempotent: safe to run repeatedly.
 - **list** — List saved posts with `--limit` and `--offset`.
 - **show** — Show full details of a post by Reddit fullname (e.g. `t3_abc123`).
 

@@ -7,6 +7,8 @@ use std::io::Cursor;
 pub struct ParsedFeed {
     pub posts: Vec<SavedPost>,
     pub errors: Vec<String>,
+    pub entry_count: usize,
+    pub last_entry_id: Option<String>,
 }
 
 pub fn parse_atom(body: &str) -> Result<ParsedFeed> {
@@ -16,6 +18,10 @@ pub fn parse_atom(body: &str) -> Result<ParsedFeed> {
 
     for (index, entry) in feed.entries.into_iter().enumerate() {
         let entry_id = entry.id.clone();
+        parsed.entry_count += 1;
+        if !entry_id.trim().is_empty() {
+            parsed.last_entry_id = Some(entry_id.trim().to_string());
+        }
         match parse_entry(entry) {
             Ok(post) => parsed.posts.push(post),
             Err(e) => parsed.errors.push(format!(
@@ -175,6 +181,28 @@ mod tests {
         let first = &posts[0];
         assert_eq!(first.reddit_fullname, "t3_abc123");
         assert_eq!(first.reddit_id, "abc123");
+    }
+
+    #[test]
+    fn parses_saved_comment_id() {
+        let feed = r#"<?xml version="1.0"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Saved</title>
+  <link href="https://example.com" rel="self"/>
+  <id>tag:example,2026:saved</id>
+  <updated>2026-01-01T00:00:00Z</updated>
+  <entry>
+    <id>t1_comment123</id>
+    <title>Saved comment</title>
+    <link href="https://www.reddit.com/r/rust/comments/post/comment/comment123/" rel="alternate"/>
+    <updated>2026-01-01T00:00:00Z</updated>
+  </entry>
+</feed>"#;
+
+        let parsed = parse_atom(feed).expect("feed should parse");
+        assert!(parsed.errors.is_empty());
+        assert_eq!(parsed.posts[0].reddit_fullname, "t1_comment123");
+        assert_eq!(parsed.posts[0].reddit_id, "comment123");
     }
 
     #[test]

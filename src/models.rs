@@ -22,6 +22,7 @@ impl SavedPost {
     pub fn new(fullname: String, title: String, permalink: String, source: String) -> Self {
         let reddit_id = fullname
             .strip_prefix("t3_")
+            .or_else(|| fullname.strip_prefix("t1_"))
             .or_else(|| fullname.strip_prefix("t2_"))
             .unwrap_or(&fullname)
             .to_string();
@@ -49,6 +50,7 @@ pub struct SyncResult {
     pub inserted_count: usize,
     pub updated_count: usize,
     pub unchanged_count: usize,
+    pub page_count: usize,
     pub parse_errors: Vec<String>,
 }
 
@@ -59,7 +61,32 @@ impl SyncResult {
             inserted_count: 0,
             updated_count: 0,
             unchanged_count: 0,
+            page_count: 0,
             parse_errors: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn derives_ids_for_posts_and_comments() {
+        let post = SavedPost::new(
+            "t3_post123".to_string(),
+            "post".to_string(),
+            "https://reddit.com/post".to_string(),
+            "atom".to_string(),
+        );
+        let comment = SavedPost::new(
+            "t1_comment123".to_string(),
+            "comment".to_string(),
+            "https://reddit.com/comment".to_string(),
+            "atom".to_string(),
+        );
+
+        assert_eq!(post.reddit_id, "post123");
+        assert_eq!(comment.reddit_id, "comment123");
     }
 }
