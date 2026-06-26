@@ -204,11 +204,15 @@ fn run_show(db_path: PathBuf, fullname: String) -> Result<()> {
 
 async fn run_enrich(db_path: PathBuf, limit: usize, dry_run: bool) -> Result<()> {
     let conn = db::init_db(&db_path)?;
-    let provider = OpenAiProvider::new(OpenAiConfig::from_env()?);
 
-    if !dry_run {
-        provider.preflight().await?;
+    if dry_run {
+        let selected_count = db::list_enrichment_candidates(&conn, limit)?.len();
+        println!("Would enrich {} posts", selected_count);
+        return Ok(());
     }
+
+    let provider = OpenAiProvider::new(OpenAiConfig::from_env()?);
+    provider.preflight().await?;
 
     let summary = enrich::run_enrichment_batch(
         &conn,
@@ -218,11 +222,6 @@ async fn run_enrich(db_path: PathBuf, limit: usize, dry_run: bool) -> Result<()>
         EnrichOptions::new(limit, dry_run),
     )
     .await?;
-
-    if dry_run {
-        println!("Would enrich {} posts", summary.selected_count);
-        return Ok(());
-    }
 
     println!(
         "Enrichment complete: {} selected, {} enriched, {} failed",

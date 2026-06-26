@@ -5,11 +5,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 use thiserror::Error;
 use url::Url;
 
 const DEFAULT_OPENAI_BASE_URL: &str = "http://127.0.0.1:8080/v1";
 const DEFAULT_OPENAI_MODEL: &str = "llama.cpp";
+const DEFAULT_OPENAI_TIMEOUT_SECS: u64 = 60;
 
 #[derive(Debug, Error)]
 pub enum EnrichError {
@@ -81,7 +83,10 @@ impl OpenAiProvider {
     pub fn new(config: OpenAiConfig) -> Self {
         Self {
             config,
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(Duration::from_secs(DEFAULT_OPENAI_TIMEOUT_SECS))
+                .build()
+                .expect("reqwest client build should not fail"),
         }
     }
 

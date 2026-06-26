@@ -101,3 +101,16 @@ fn binary_triage_json_outputs_records() {
     assert!(stdout.contains("\"reddit_fullname\":\"t3_json\""));
     assert!(stdout.contains("\"recommended_action\":\"reference_only\""));
 }
+
+#[test]
+fn binary_enrich_dry_run_does_not_require_valid_llm_config() {
+    let output = Command::new(binary())
+        .args(["--db-path", &test_db_path(), "enrich", "--dry-run"])
+        .env("RUSTY_RSS_OPENAI_BASE_URL", "not a url")
+        .output()
+        .expect("binary should run");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Would enrich 0 posts"));
+}

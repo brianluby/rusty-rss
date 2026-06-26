@@ -70,6 +70,8 @@ pub fn init_db(db_path: &Path) -> Result<Connection> {
 
         CREATE INDEX IF NOT EXISTS idx_enrichment_runs_post_created
             ON enrichment_runs(reddit_fullname, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_enrichment_runs_post_id
+            ON enrichment_runs(reddit_fullname, id DESC);
         CREATE INDEX IF NOT EXISTS idx_enrichment_runs_status
             ON enrichment_runs(status);
         CREATE INDEX IF NOT EXISTS idx_enrichment_runs_action
@@ -358,6 +360,10 @@ pub fn count_posts(conn: &Connection) -> Result<usize> {
 }
 
 pub fn list_enrichment_candidates(conn: &Connection, limit: usize) -> Result<Vec<SavedPost>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
     let mut stmt = conn.prepare(
         "SELECT reddit_fullname, reddit_id, title, author, subreddit, permalink,
                 outbound_url, content_markdown, thumbnail_url, published_at, updated_at,
@@ -372,7 +378,7 @@ pub fn list_enrichment_candidates(conn: &Connection, limit: usize) -> Result<Vec
     )?;
 
     let rows = stmt
-        .query_map(params![limit.max(1)], saved_post_from_row)
+        .query_map(params![limit], saved_post_from_row)
         .context("failed to query enrichment candidates")?;
 
     rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -388,6 +394,10 @@ pub fn record_enrichment_success(
     raw_response: &str,
     output: &EnrichmentOutput,
 ) -> Result<i64> {
+    output
+        .validate()
+        .map_err(|err| anyhow::anyhow!("invalid enrichment output: {err}"))?;
+
     let tags_json = serde_json::to_string(&output.tags).context("failed to serialize tags")?;
     conn.execute(
         r#"INSERT INTO enrichment_runs (
@@ -496,6 +506,10 @@ pub fn list_triage_items(
     limit: usize,
     offset: usize,
 ) -> Result<Vec<TriageItem>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
     let where_clause = match view {
         TriageView::All => "1 = 1",
         TriageView::Unprocessed => {
@@ -535,7 +549,7 @@ pub fn list_triage_items(
     );
     let mut stmt = conn.prepare(&query)?;
     let rows = stmt
-        .query_map(params![limit.max(1), offset], triage_item_from_row)
+        .query_map(params![limit, offset], triage_item_from_row)
         .context("failed to query triage items")?;
 
     rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -968,5 +982,45 @@ mod tests {
         let discard = list_triage_items(&conn, TriageView::Discard, 10, 0)
             .expect("discard view should query");
         assert_eq!(discard[0].reddit_fullname, "t3_discard");
+    }
+
+    #[test]
+    fn zero_limits_return_no_enrichment_or_triage_rows() {
+        let conn = test_db();
+        let post = test_post();
+        upsert_post(&conn, &post).expect("post should insert");
+
+        let candidates = list_enrichment_candidates(&conn, 0).expect("candidates should query");
+        assert!(candidates.is_empty());
+
+        let items = list_triage_items(&conn, TriageView::All, 0, 0).expect("triage should query");
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn record_enrichment_success_rejects_invalid_output() {
+        let conn = test_db();
+        let post = test_post();
+        upsert_post(&conn, &post).expect("post should insert");
+        let mut output = test_output(RecommendedAction::ReferenceOnly, "invalid");
+        output.confidence = 2.0;
+
+        let err = record_enrichment_success(
+            &conn,
+            "t3_test123",
+            "provider",
+            "model",
+            "prompt",
+            "raw",
+            &output,
+        )
+        .expect_err("invalid output should not persist");
+
+        assert!(err.to_string().contains("invalid enrichment output"));
+        assert!(
+            latest_enrichment(&conn, "t3_test123")
+                .expect("latest should query")
+                .is_none()
+        );
     }
 }
