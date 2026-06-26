@@ -1,10 +1,4 @@
 mod cli;
-mod config;
-mod db;
-mod fetch;
-mod models;
-mod parse;
-mod sync;
 
 use anyhow::Result;
 use clap::Parser;

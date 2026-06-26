@@ -1,4 +1,6 @@
-use crate::models::SavedPost;
+use crate::models::{
+    Classification, EnrichmentOutput, EnrichmentRecord, RecommendedAction, SavedPost, TriageItem,
+};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -44,6 +46,34 @@ pub fn init_db(db_path: &Path) -> Result<Connection> {
             updated_count INTEGER DEFAULT 0,
             error TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS enrichment_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            reddit_fullname TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            prompt_version TEXT NOT NULL,
+            status TEXT NOT NULL,
+            raw_response TEXT,
+            classification TEXT,
+            tags_json TEXT,
+            summary TEXT,
+            joy_value REAL,
+            work_value REAL,
+            recommended_action TEXT,
+            rationale TEXT,
+            confidence REAL,
+            error TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (reddit_fullname) REFERENCES saved_posts(reddit_fullname)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_enrichment_runs_post_created
+            ON enrichment_runs(reddit_fullname, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_enrichment_runs_status
+            ON enrichment_runs(status);
+        CREATE INDEX IF NOT EXISTS idx_enrichment_runs_action
+            ON enrichment_runs(recommended_action);
         "#,
     )
     .context("failed to initialize database schema")?;
@@ -327,6 +357,317 @@ pub fn count_posts(conn: &Connection) -> Result<usize> {
     .context("failed to count posts")
 }
 
+pub fn list_enrichment_candidates(conn: &Connection, limit: usize) -> Result<Vec<SavedPost>> {
+    let mut stmt = conn.prepare(
+        "SELECT reddit_fullname, reddit_id, title, author, subreddit, permalink,
+                outbound_url, content_markdown, thumbnail_url, published_at, updated_at,
+                first_seen_at, last_seen_at, source
+         FROM saved_posts p
+         WHERE NOT EXISTS (
+             SELECT 1 FROM enrichment_runs e
+             WHERE e.reddit_fullname = p.reddit_fullname AND e.status = 'success'
+         )
+         ORDER BY last_seen_at DESC
+         LIMIT ?",
+    )?;
+
+    let rows = stmt
+        .query_map(params![limit.max(1)], saved_post_from_row)
+        .context("failed to query enrichment candidates")?;
+
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to collect enrichment candidates")
+}
+
+pub fn record_enrichment_success(
+    conn: &Connection,
+    reddit_fullname: &str,
+    provider: &str,
+    model: &str,
+    prompt_version: &str,
+    raw_response: &str,
+    output: &EnrichmentOutput,
+) -> Result<i64> {
+    let tags_json = serde_json::to_string(&output.tags).context("failed to serialize tags")?;
+    conn.execute(
+        r#"INSERT INTO enrichment_runs (
+            reddit_fullname, provider, model, prompt_version, status, raw_response,
+            classification, tags_json, summary, joy_value, work_value,
+            recommended_action, rationale, confidence, created_at
+        ) VALUES (?, ?, ?, ?, 'success', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+        params![
+            reddit_fullname,
+            provider,
+            model,
+            prompt_version,
+            raw_response,
+            output.classification.as_str(),
+            tags_json,
+            output.summary,
+            output.joy_value,
+            output.work_value,
+            output.recommended_action.as_str(),
+            output.rationale,
+            output.confidence,
+            Utc::now().to_rfc3339(),
+        ],
+    )
+    .context("failed to record enrichment success")?;
+
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn record_enrichment_failure(
+    conn: &Connection,
+    reddit_fullname: &str,
+    provider: &str,
+    model: &str,
+    prompt_version: &str,
+    error: &str,
+) -> Result<i64> {
+    conn.execute(
+        r#"INSERT INTO enrichment_runs (
+            reddit_fullname, provider, model, prompt_version, status, error, created_at
+        ) VALUES (?, ?, ?, ?, 'error', ?, ?)"#,
+        params![
+            reddit_fullname,
+            provider,
+            model,
+            prompt_version,
+            error,
+            Utc::now().to_rfc3339(),
+        ],
+    )
+    .context("failed to record enrichment failure")?;
+
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn latest_enrichment(
+    conn: &Connection,
+    reddit_fullname: &str,
+) -> Result<Option<EnrichmentRecord>> {
+    conn.query_row(
+        "SELECT id, reddit_fullname, provider, model, prompt_version, status,
+                raw_response, classification, tags_json, summary, joy_value, work_value,
+                recommended_action, rationale, confidence, error, created_at
+         FROM enrichment_runs
+         WHERE reddit_fullname = ?
+         ORDER BY id DESC
+         LIMIT 1",
+        params![reddit_fullname],
+        enrichment_record_from_row,
+    )
+    .optional()
+    .context("failed to query latest enrichment")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriageView {
+    All,
+    Unprocessed,
+    HighValue,
+    ShouldTest,
+    ShouldBuild,
+    ReadingQueue,
+    ReferenceOnly,
+    Discard,
+}
+
+impl TriageView {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "all" => Some(Self::All),
+            "unprocessed" => Some(Self::Unprocessed),
+            "high-value" | "high_value" => Some(Self::HighValue),
+            "should-test" | "should_test" => Some(Self::ShouldTest),
+            "should-build" | "should_build" => Some(Self::ShouldBuild),
+            "reading-queue" | "reading_queue" => Some(Self::ReadingQueue),
+            "reference-only" | "reference_only" | "reference" => Some(Self::ReferenceOnly),
+            "discard" => Some(Self::Discard),
+            _ => None,
+        }
+    }
+}
+
+pub fn list_triage_items(
+    conn: &Connection,
+    view: TriageView,
+    limit: usize,
+    offset: usize,
+) -> Result<Vec<TriageItem>> {
+    let where_clause = match view {
+        TriageView::All => "1 = 1",
+        TriageView::Unprocessed => {
+            "NOT EXISTS (
+                SELECT 1 FROM enrichment_runs success
+                WHERE success.reddit_fullname = p.reddit_fullname AND success.status = 'success'
+            )"
+        }
+        TriageView::HighValue => {
+            "e.status = 'success' AND (e.joy_value >= 0.7 OR e.work_value >= 0.7)"
+        }
+        TriageView::ShouldTest => "e.status = 'success' AND e.recommended_action = 'should_test'",
+        TriageView::ShouldBuild => "e.status = 'success' AND e.recommended_action = 'should_build'",
+        TriageView::ReadingQueue => {
+            "e.status = 'success' AND e.recommended_action = 'reading_queue'"
+        }
+        TriageView::ReferenceOnly => {
+            "e.status = 'success' AND e.recommended_action = 'reference_only'"
+        }
+        TriageView::Discard => "e.status = 'success' AND e.recommended_action = 'discard'",
+    };
+    let query = format!(
+        "SELECT p.reddit_fullname, p.title, p.subreddit, p.author, p.permalink, p.outbound_url,
+                e.id, e.reddit_fullname, e.provider, e.model, e.prompt_version, e.status,
+                e.raw_response, e.classification, e.tags_json, e.summary, e.joy_value, e.work_value,
+                e.recommended_action, e.rationale, e.confidence, e.error, e.created_at
+         FROM saved_posts p
+         LEFT JOIN enrichment_runs e ON e.id = (
+             SELECT id FROM enrichment_runs latest
+             WHERE latest.reddit_fullname = p.reddit_fullname
+             ORDER BY latest.id DESC
+             LIMIT 1
+         )
+         WHERE {where_clause}
+         ORDER BY p.last_seen_at DESC
+         LIMIT ? OFFSET ?"
+    );
+    let mut stmt = conn.prepare(&query)?;
+    let rows = stmt
+        .query_map(params![limit.max(1), offset], triage_item_from_row)
+        .context("failed to query triage items")?;
+
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to collect triage items")
+}
+
+fn saved_post_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SavedPost> {
+    Ok(SavedPost {
+        reddit_fullname: row.get(0)?,
+        reddit_id: row.get(1)?,
+        title: row.get(2)?,
+        author: row.get(3)?,
+        subreddit: row.get(4)?,
+        permalink: row.get(5)?,
+        outbound_url: row.get(6)?,
+        content_markdown: row.get(7)?,
+        thumbnail_url: row.get(8)?,
+        published_at: row.get::<_, Option<String>>(9)?.and_then(|s| {
+            chrono::DateTime::parse_from_rfc3339(&s)
+                .map(|dt| dt.with_timezone(&Utc))
+                .ok()
+        }),
+        updated_at: row.get::<_, Option<String>>(10)?.and_then(|s| {
+            chrono::DateTime::parse_from_rfc3339(&s)
+                .map(|dt| dt.with_timezone(&Utc))
+                .ok()
+        }),
+        source: row.get(13)?,
+    })
+}
+
+fn enrichment_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EnrichmentRecord> {
+    let status: String = row.get(5)?;
+    let output = if status == "success" {
+        Some(EnrichmentOutput {
+            classification: row
+                .get::<_, String>(7)?
+                .parse()
+                .unwrap_or(Classification::Other),
+            tags: row
+                .get::<_, Option<String>>(8)?
+                .and_then(|tags| serde_json::from_str(&tags).ok())
+                .unwrap_or_default(),
+            summary: row.get(9)?,
+            joy_value: row.get(10)?,
+            work_value: row.get(11)?,
+            recommended_action: row
+                .get::<_, String>(12)?
+                .parse()
+                .unwrap_or(RecommendedAction::Other),
+            rationale: row.get(13)?,
+            confidence: row.get(14)?,
+        })
+    } else {
+        None
+    };
+
+    Ok(EnrichmentRecord {
+        id: row.get(0)?,
+        reddit_fullname: row.get(1)?,
+        provider: row.get(2)?,
+        model: row.get(3)?,
+        prompt_version: row.get(4)?,
+        status,
+        raw_response: row.get(6)?,
+        output,
+        error: row.get(15)?,
+        created_at: row.get(16)?,
+    })
+}
+
+fn triage_item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TriageItem> {
+    let enrichment = if row.get::<_, Option<i64>>(6)?.is_some() {
+        Some(enrichment_record_from_row_with_offset(row, 6)?)
+    } else {
+        None
+    };
+
+    Ok(TriageItem {
+        reddit_fullname: row.get(0)?,
+        title: row.get(1)?,
+        subreddit: row.get(2)?,
+        author: row.get(3)?,
+        permalink: row.get(4)?,
+        outbound_url: row.get(5)?,
+        enrichment,
+    })
+}
+
+fn enrichment_record_from_row_with_offset(
+    row: &rusqlite::Row<'_>,
+    offset: usize,
+) -> rusqlite::Result<EnrichmentRecord> {
+    let status: String = row.get(offset + 5)?;
+    let output = if status == "success" {
+        Some(EnrichmentOutput {
+            classification: row
+                .get::<_, String>(offset + 7)?
+                .parse()
+                .unwrap_or(Classification::Other),
+            tags: row
+                .get::<_, Option<String>>(offset + 8)?
+                .and_then(|tags| serde_json::from_str(&tags).ok())
+                .unwrap_or_default(),
+            summary: row.get(offset + 9)?,
+            joy_value: row.get(offset + 10)?,
+            work_value: row.get(offset + 11)?,
+            recommended_action: row
+                .get::<_, String>(offset + 12)?
+                .parse()
+                .unwrap_or(RecommendedAction::Other),
+            rationale: row.get(offset + 13)?,
+            confidence: row.get(offset + 14)?,
+        })
+    } else {
+        None
+    };
+
+    Ok(EnrichmentRecord {
+        id: row.get(offset)?,
+        reddit_fullname: row.get(offset + 1)?,
+        provider: row.get(offset + 2)?,
+        model: row.get(offset + 3)?,
+        prompt_version: row.get(offset + 4)?,
+        status,
+        raw_response: row.get(offset + 6)?,
+        output,
+        error: row.get(offset + 15)?,
+        created_at: row.get(offset + 16)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,6 +697,19 @@ mod tests {
         post.published_at = Some(Utc::now());
         post.content_markdown = Some("Test markdown".to_string());
         post
+    }
+
+    fn test_output(action: RecommendedAction, summary: &str) -> EnrichmentOutput {
+        EnrichmentOutput {
+            classification: Classification::Reference,
+            tags: vec!["rust".to_string()],
+            summary: summary.to_string(),
+            joy_value: 0.2,
+            work_value: 0.8,
+            recommended_action: action,
+            rationale: "Useful later".to_string(),
+            confidence: 0.9,
+        }
     }
 
     #[test]
@@ -532,5 +886,87 @@ mod tests {
             )
             .expect("migrated markdown should exist");
         assert_eq!(migrated, "Hello **Markdown**");
+    }
+
+    #[test]
+    fn enrichment_runs_keep_raw_output_and_latest_normalized_fields() {
+        let conn = test_db();
+        let post = test_post();
+        upsert_post(&conn, &post).expect("post should insert");
+
+        let first = record_enrichment_success(
+            &conn,
+            "t3_test123",
+            "provider",
+            "model-a",
+            "prompt-v1",
+            "raw one",
+            &test_output(RecommendedAction::ReadingQueue, "first"),
+        )
+        .expect("first enrichment should insert");
+        let second = record_enrichment_success(
+            &conn,
+            "t3_test123",
+            "provider",
+            "model-b",
+            "prompt-v1",
+            "raw two",
+            &test_output(RecommendedAction::ShouldBuild, "second"),
+        )
+        .expect("second enrichment should insert");
+
+        assert_ne!(first, second);
+
+        let latest = latest_enrichment(&conn, "t3_test123")
+            .expect("latest should query")
+            .expect("latest should exist");
+        assert_eq!(latest.id, second);
+        assert_eq!(latest.raw_response, Some("raw two".to_string()));
+        assert_eq!(latest.model, "model-b");
+        assert_eq!(
+            latest
+                .output
+                .expect("normalized output should exist")
+                .recommended_action,
+            RecommendedAction::ShouldBuild
+        );
+    }
+
+    #[test]
+    fn triage_views_filter_latest_enrichment() {
+        let conn = test_db();
+        for fullname in ["t3_build", "t3_test", "t3_read", "t3_ref", "t3_discard"] {
+            let mut post = test_post();
+            post.reddit_fullname = fullname.to_string();
+            post.reddit_id = fullname.trim_start_matches("t3_").to_string();
+            upsert_post(&conn, &post).expect("post should insert");
+        }
+
+        for (fullname, action, work_value) in [
+            ("t3_build", RecommendedAction::ShouldBuild, 0.9),
+            ("t3_test", RecommendedAction::ShouldTest, 0.8),
+            ("t3_read", RecommendedAction::ReadingQueue, 0.4),
+            ("t3_ref", RecommendedAction::ReferenceOnly, 0.71),
+            ("t3_discard", RecommendedAction::Discard, 0.1),
+        ] {
+            let mut output = test_output(action, fullname);
+            output.work_value = work_value;
+            record_enrichment_success(
+                &conn, fullname, "provider", "model", "prompt", "raw", &output,
+            )
+            .expect("enrichment should insert");
+        }
+
+        let build = list_triage_items(&conn, TriageView::ShouldBuild, 10, 0)
+            .expect("build view should query");
+        assert_eq!(build[0].reddit_fullname, "t3_build");
+
+        let high_value = list_triage_items(&conn, TriageView::HighValue, 10, 0)
+            .expect("high value view should query");
+        assert_eq!(high_value.len(), 3);
+
+        let discard = list_triage_items(&conn, TriageView::Discard, 10, 0)
+            .expect("discard view should query");
+        assert_eq!(discard[0].reddit_fullname, "t3_discard");
     }
 }

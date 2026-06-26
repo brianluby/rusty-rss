@@ -270,8 +270,11 @@ mod tests {
 
     #[tokio::test]
     async fn run_sync_inserts_then_reports_unchanged() {
-        let feed =
-            std::fs::read_to_string("test-fixtures/atom-feed.xml").expect("fixture should exist");
+        let feed = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test-fixtures/atom-feed.xml"
+        ))
+        .expect("fixture should exist");
         let db_path = test_db_path();
         let config = config_for(serve_feed(feed), db_path.clone());
 

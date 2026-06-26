@@ -153,7 +153,11 @@ mod tests {
     use std::fs;
 
     fn load_fixture() -> String {
-        fs::read_to_string("test-fixtures/atom-feed.xml").expect("fixture file should exist")
+        fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test-fixtures/atom-feed.xml"
+        ))
+        .expect("fixture file should exist")
     }
 
     fn parse_fixture_posts() -> Vec<SavedPost> {
