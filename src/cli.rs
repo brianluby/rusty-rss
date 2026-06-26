@@ -1,8 +1,10 @@
-use crate::config::{Config, DEFAULT_MAX_PAGES, DEFAULT_SYNC_LIMIT};
-use crate::db;
-use crate::sync;
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand};
+use rusty_rss_core::config::{Config, DEFAULT_MAX_PAGES, DEFAULT_SYNC_LIMIT};
+use rusty_rss_core::db::TriageView;
+use rusty_rss_core::enrich::{self, EnrichOptions};
+use rusty_rss_core::llm::{OpenAiConfig, OpenAiProvider};
+use rusty_rss_core::{db, sync};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -54,6 +56,33 @@ pub enum Command {
         /// Reddit fullname (e.g., t3_abc123)
         fullname: String,
     },
+    /// Enrich saved posts through the configured OpenAI-compatible LLM server
+    Enrich {
+        /// Maximum number of unenriched posts to process
+        #[arg(short, long, default_value = "20")]
+        limit: usize,
+
+        /// Show how many posts would be enriched without calling the LLM or writing rows
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// List triage views from latest enrichment data
+    Triage {
+        /// View: all, unprocessed, high-value, should-test, should-build, reading-queue, reference-only, discard
+        view: String,
+
+        /// Number of items to show
+        #[arg(short, long, default_value = "20")]
+        limit: usize,
+
+        /// Offset for pagination
+        #[arg(short, long, default_value = "0")]
+        offset: usize,
+
+        /// Emit newline-delimited JSON records
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
@@ -73,6 +102,15 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
         Command::List { limit, offset } => run_list(PathBuf::from(cli.db_path), limit, offset),
         Command::Show { fullname } => run_show(PathBuf::from(cli.db_path), fullname),
+        Command::Enrich { limit, dry_run } => {
+            run_enrich(PathBuf::from(cli.db_path), limit, dry_run).await
+        }
+        Command::Triage {
+            view,
+            limit,
+            offset,
+            json,
+        } => run_triage(PathBuf::from(cli.db_path), &view, limit, offset, json),
     }
 }
 
@@ -164,11 +202,81 @@ fn run_show(db_path: PathBuf, fullname: String) -> Result<()> {
     Ok(())
 }
 
+async fn run_enrich(db_path: PathBuf, limit: usize, dry_run: bool) -> Result<()> {
+    let conn = db::init_db(&db_path)?;
+
+    if dry_run {
+        let selected_count = db::list_enrichment_candidates(&conn, limit)?.len();
+        println!("Would enrich {} posts", selected_count);
+        return Ok(());
+    }
+
+    let provider = OpenAiProvider::new(OpenAiConfig::from_env()?);
+    provider.preflight().await?;
+
+    let summary = enrich::run_enrichment_batch(
+        &conn,
+        &provider,
+        "openai-compatible",
+        provider.model(),
+        EnrichOptions::new(limit, dry_run),
+    )
+    .await?;
+
+    println!(
+        "Enrichment complete: {} selected, {} enriched, {} failed",
+        summary.selected_count, summary.enriched_count, summary.failed_count
+    );
+    for failure in summary.failures {
+        eprintln!("  ERROR [{}]: {}", failure.reddit_fullname, failure.error);
+    }
+
+    Ok(())
+}
+
+fn run_triage(db_path: PathBuf, view: &str, limit: usize, offset: usize, json: bool) -> Result<()> {
+    let view = TriageView::parse(view).ok_or_else(|| anyhow!("unknown triage view: {view}"))?;
+    let conn = db::init_db(&db_path)?;
+    let items = db::list_triage_items(&conn, view, limit, offset)?;
+
+    if json {
+        for item in items {
+            println!("{}", serde_json::to_string(&item)?);
+        }
+        return Ok(());
+    }
+
+    if items.is_empty() {
+        println!("No matching items found.");
+        return Ok(());
+    }
+
+    for (index, item) in items.iter().enumerate() {
+        let sub = item.subreddit.as_deref().unwrap_or("(no subreddit)");
+        let action = item
+            .enrichment
+            .as_ref()
+            .and_then(|record| record.output.as_ref())
+            .map(|output| output.recommended_action.as_str())
+            .unwrap_or("unprocessed");
+        println!(
+            "  {}. [{}] {} in r/{} ({})",
+            index + 1 + offset,
+            item.reddit_fullname,
+            item.title,
+            sub,
+            action
+        );
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db;
-    use crate::models::SavedPost;
+    use rusty_rss_core::db;
+    use rusty_rss_core::models::SavedPost;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -194,6 +302,30 @@ mod tests {
         post.subreddit = Some("rust".to_string());
         post.content_markdown = Some("content".to_string());
         db::upsert_post(&conn, &post).expect("post should insert");
+    }
+
+    fn insert_enriched_post(db_path: &std::path::Path) {
+        insert_post(db_path);
+        let conn = db::init_db(db_path).expect("db should initialize");
+        db::record_enrichment_success(
+            &conn,
+            "t3_cli123",
+            "test",
+            "test-model",
+            "test-prompt",
+            "raw",
+            &rusty_rss_core::models::EnrichmentOutput {
+                classification: rusty_rss_core::models::Classification::Reference,
+                tags: vec!["rust".to_string()],
+                summary: "Useful".to_string(),
+                joy_value: 0.2,
+                work_value: 0.8,
+                recommended_action: rusty_rss_core::models::RecommendedAction::ReferenceOnly,
+                rationale: "Useful later".to_string(),
+                confidence: 0.9,
+            },
+        )
+        .expect("enrichment should insert");
     }
 
     #[test]
@@ -232,5 +364,13 @@ mod tests {
         };
 
         run(cli).await.expect("list command should succeed");
+    }
+
+    #[test]
+    fn triage_json_returns_enriched_rows() {
+        let db_path = test_db_path();
+        insert_enriched_post(&db_path);
+
+        run_triage(db_path, "reference-only", 10, 0, true).expect("triage should succeed");
     }
 }
