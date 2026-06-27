@@ -3,11 +3,30 @@
 use crate::models::SavedPost;
 use anyhow::{Context, Result};
 use chrono::Utc;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 pub fn upsert_post(conn: &Connection, post: &SavedPost) -> Result<UpsertResult> {
     let now = Utc::now().to_rfc3339();
 
+    // The existence check and the follow-up write must be atomic. If the caller
+    // is not already in a transaction, take a write lock up front (IMMEDIATE) so
+    // concurrent upserts serialize instead of racing between the SELECT and the
+    // write. If the caller already holds a transaction, reuse it: that provides
+    // the atomicity, and starting a nested transaction would fail.
+    if conn.is_autocommit() {
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+            .context("failed to begin upsert transaction")?;
+        let result = upsert_post_in_tx(&tx, post, &now)?;
+        tx.commit().context("failed to commit upsert")?;
+        Ok(result)
+    } else {
+        upsert_post_in_tx(conn, post, &now)
+    }
+}
+
+/// Perform the existence check and insert/update. The caller is responsible for
+/// the surrounding transaction (see [`upsert_post`]).
+fn upsert_post_in_tx(conn: &Connection, post: &SavedPost, now: &str) -> Result<UpsertResult> {
     let existing = conn
         .query_row(
             "SELECT reddit_id, title, author, subreddit, permalink, outbound_url,
@@ -45,14 +64,11 @@ pub fn upsert_post(conn: &Connection, post: &SavedPost) -> Result<UpsertResult> 
         )
         .context("failed to insert post")?;
 
-        return Ok(UpsertResult::Inserted);
-    }
-
-    let needs_update = existing
+        Ok(UpsertResult::Inserted)
+    } else if existing
         .as_ref()
-        .is_some_and(|existing| existing.differs_from(post));
-
-    if needs_update {
+        .is_some_and(|existing| existing.differs_from(post))
+    {
         conn.execute(
             r#"UPDATE saved_posts SET
                 reddit_id = ?, title = ?, author = ?, subreddit = ?, permalink = ?,
@@ -147,7 +163,7 @@ pub fn list_posts(conn: &Connection, limit: usize, offset: usize) -> Result<Vec<
     let mut stmt = conn.prepare(
         "SELECT reddit_fullname, title, author, subreddit, permalink, published_at, last_seen_at
          FROM saved_posts
-         ORDER BY last_seen_at DESC
+         ORDER BY last_seen_at DESC, reddit_fullname DESC
          LIMIT ? OFFSET ?",
     )?;
 
@@ -199,16 +215,8 @@ pub fn get_post(conn: &Connection, fullname: &str) -> Result<Option<SavedPost>> 
                     outbound_url: row.get(6)?,
                     content_markdown: row.get(7)?,
                     thumbnail_url: row.get(8)?,
-                    published_at: row.get::<_, Option<String>>(9)?.and_then(|s| {
-                        chrono::DateTime::parse_from_rfc3339(&s)
-                            .map(|dt| dt.with_timezone(&Utc))
-                            .ok()
-                    }),
-                    updated_at: row.get::<_, Option<String>>(10)?.and_then(|s| {
-                        chrono::DateTime::parse_from_rfc3339(&s)
-                            .map(|dt| dt.with_timezone(&Utc))
-                            .ok()
-                    }),
+                    published_at: parse_optional_timestamp(row, 9)?,
+                    updated_at: parse_optional_timestamp(row, 10)?,
                     source: row.get(13)?,
                 })
             },
@@ -239,18 +247,29 @@ pub(super) fn saved_post_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<S
         outbound_url: row.get(6)?,
         content_markdown: row.get(7)?,
         thumbnail_url: row.get(8)?,
-        published_at: row.get::<_, Option<String>>(9)?.and_then(|s| {
-            chrono::DateTime::parse_from_rfc3339(&s)
-                .map(|dt| dt.with_timezone(&Utc))
-                .ok()
-        }),
-        updated_at: row.get::<_, Option<String>>(10)?.and_then(|s| {
-            chrono::DateTime::parse_from_rfc3339(&s)
-                .map(|dt| dt.with_timezone(&Utc))
-                .ok()
-        }),
+        published_at: parse_optional_timestamp(row, 9)?,
+        updated_at: parse_optional_timestamp(row, 10)?,
         source: row.get(13)?,
     })
+}
+
+/// Parse an optional RFC 3339 timestamp column into UTC. A malformed value
+/// surfaces as a row-conversion error instead of being silently dropped to
+/// `None`, so corrupted persisted data is distinguishable from a missing value.
+fn parse_optional_timestamp(
+    row: &rusqlite::Row<'_>,
+    idx: usize,
+) -> rusqlite::Result<Option<chrono::DateTime<Utc>>> {
+    row.get::<_, Option<String>>(idx)?
+        .map(|s| chrono::DateTime::parse_from_rfc3339(&s).map(|dt| dt.with_timezone(&Utc)))
+        .transpose()
+        .map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                idx,
+                rusqlite::types::Type::Text,
+                Box::new(err),
+            )
+        })
 }
 
 #[cfg(test)]
@@ -328,10 +347,15 @@ mod tests {
         let post = test_post();
         upsert_post(&conn, &post).expect("first upsert should succeed");
 
-        let first = get_post(&conn, "t3_test123")
-            .expect("get should succeed")
-            .expect("post should exist");
-        let first_seen = first.reddit_fullname.clone();
+        let read_timestamps = || {
+            conn.query_row(
+                "SELECT first_seen_at, last_seen_at FROM saved_posts WHERE reddit_fullname = ?",
+                params!["t3_test123"],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .expect("timestamps should query")
+        };
+        let (first_seen, first_last_seen) = read_timestamps();
 
         std::thread::sleep(std::time::Duration::from_millis(10));
 
@@ -339,12 +363,38 @@ mod tests {
         updated.title = "New Title".to_string();
         upsert_post(&conn, &updated).expect("update should succeed");
 
-        let second = get_post(&conn, "t3_test123")
+        let (second_seen, second_last_seen) = read_timestamps();
+
+        // The update must preserve first_seen_at while advancing last_seen_at.
+        assert_eq!(
+            first_seen, second_seen,
+            "first_seen_at must not change on update"
+        );
+        assert_ne!(
+            first_last_seen, second_last_seen,
+            "last_seen_at should advance on update"
+        );
+
+        let fetched = get_post(&conn, "t3_test123")
             .expect("get should succeed")
             .expect("post should exist");
+        assert_eq!(fetched.title, "New Title");
+    }
 
-        assert_eq!(first_seen, "t3_test123");
-        assert_eq!(second.title, "New Title");
+    #[test]
+    fn malformed_timestamp_surfaces_as_error() {
+        let conn = test_db();
+        let post = test_post();
+        upsert_post(&conn, &post).expect("post should insert");
+
+        conn.execute(
+            "UPDATE saved_posts SET published_at = 'not-a-timestamp' WHERE reddit_fullname = ?",
+            params!["t3_test123"],
+        )
+        .expect("corrupting the timestamp should succeed");
+
+        let err = get_post(&conn, "t3_test123").expect_err("malformed timestamp should fail");
+        assert!(err.to_string().contains("failed to query post"));
     }
 
     #[test]

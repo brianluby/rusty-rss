@@ -52,7 +52,7 @@ pub fn list_export_records(
            AND (? IS NULL OR e.recommended_action = ?)
            AND (? IS NULL OR e.joy_value >= ?)
            AND (? IS NULL OR e.work_value >= ?)
-         ORDER BY p.last_seen_at DESC
+         ORDER BY p.last_seen_at DESC, p.reddit_fullname DESC
          LIMIT ? OFFSET ?",
     )?;
 
@@ -170,5 +170,35 @@ mod tests {
                 .and_then(|capture| capture.title.as_deref()),
             Some("Captured title")
         );
+    }
+
+    #[test]
+    fn export_pagination_is_deterministic_on_tied_timestamps() {
+        let conn = test_db();
+        for fullname in ["t3_aaa", "t3_bbb"] {
+            let mut post = test_post();
+            post.reddit_fullname = fullname.to_string();
+            post.reddit_id = fullname.trim_start_matches("t3_").to_string();
+            upsert_post(&conn, &post).expect("post should insert");
+        }
+        // Force identical last_seen_at so page order depends on the tiebreaker.
+        conn.execute(
+            "UPDATE saved_posts SET last_seen_at = '2026-01-01T00:00:00Z'",
+            [],
+        )
+        .expect("tying timestamps should succeed");
+
+        let page = |offset| {
+            list_export_records(&conn, &ExportFilters::default(), 1, offset)
+                .expect("export should query")
+        };
+        let first = page(0);
+        let second = page(1);
+
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        // Tiebreaker is reddit_fullname DESC, so t3_bbb precedes t3_aaa.
+        assert_eq!(first[0].saved_post.reddit_fullname, "t3_bbb");
+        assert_eq!(second[0].saved_post.reddit_fullname, "t3_aaa");
     }
 }
