@@ -38,6 +38,8 @@ This documentation is organized with the Diataxis model:
 
 - [Architecture](explanation/architecture.md)
 - [Enrichment and triage](explanation/enrichment-and-triage.md)
+- [Error handling in core](explanation/error-handling.md)
+- [Dependency maintenance](explanation/dependency-maintenance.md)
 
 ## Agent Artifacts
 
