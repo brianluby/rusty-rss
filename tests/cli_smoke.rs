@@ -61,6 +61,40 @@ fn binary_sync_requires_feed_url() {
 }
 
 #[test]
+fn binary_no_subcommand_runs_default_sync() {
+    // A bare invocation (no subcommand) must route to the bounded default sync,
+    // which requires a feed URL. Hitting that specific error proves the no-arg
+    // path dispatched to sync rather than failing on a missing subcommand.
+    let output = Command::new(binary())
+        .args(["--db-path", &test_db_path()])
+        .env_remove("RUSTY_RSS_FEED_URL")
+        .output()
+        .expect("binary should run");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("feed URL is required"),
+        "no-arg invocation should route to sync: {stderr}"
+    );
+}
+
+#[test]
+fn binary_help_documents_default_sync() {
+    let output = Command::new(binary())
+        .arg("--help")
+        .output()
+        .expect("binary should run");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("max-pages 10"),
+        "help should document the bounded default sync: {stdout}"
+    );
+}
+
+#[test]
 fn binary_triage_json_outputs_records() {
     let db_path = test_db_path();
     let conn = db::init_db(std::path::Path::new(&db_path)).expect("db should initialize");
@@ -138,6 +172,94 @@ fn binary_search_json_outputs_records() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("\"reddit_fullname\":\"t3_search_json\""));
     assert!(stdout.contains("<mark>searchable</mark>"));
+    // The default post-only search still reports which source matched.
+    assert!(stdout.contains("\"source\":\"posts\""));
+}
+
+#[test]
+fn binary_search_source_capture_reports_matched_source() {
+    let db_path = test_db_path();
+    let conn = db::init_db(std::path::Path::new(&db_path)).expect("db should initialize");
+    let mut post = SavedPost::new(
+        "t3_capsearch".to_string(),
+        "Plain title".to_string(),
+        "https://reddit.com/r/rust/comments/capsearch/item/".to_string(),
+        "atom".to_string(),
+    );
+    post.content_markdown = Some("nothing notable here".to_string());
+    db::upsert_post(&conn, &post).expect("post should insert");
+    db::upsert_outbound_capture(
+        &conn,
+        &db::OutboundCaptureUpsert {
+            reddit_fullname: "t3_capsearch".to_string(),
+            original_url: "https://example.com/article".to_string(),
+            final_url: None,
+            canonical_url: None,
+            title: Some("Captured heading".to_string()),
+            description: Some("tungsten deep dive in the captured page".to_string()),
+            site_name: Some("example.com".to_string()),
+            preview_image_url: None,
+            content_markdown: None,
+            content_hash: None,
+            status: "success".to_string(),
+            http_status: Some(200),
+            error: None,
+        },
+    )
+    .expect("capture should insert");
+
+    // The term lives only in the capture, so a post-only search misses it.
+    let posts_only = Command::new(binary())
+        .args(["--db-path", &db_path, "search", "tungsten", "--json"])
+        .output()
+        .expect("binary should run");
+    assert!(posts_only.status.success());
+    assert!(
+        String::from_utf8_lossy(&posts_only.stdout)
+            .trim()
+            .is_empty(),
+        "post-only search must not find capture-only text"
+    );
+
+    // Searching all sources finds it and reports the matching source.
+    let all = Command::new(binary())
+        .args([
+            "--db-path",
+            &db_path,
+            "search",
+            "tungsten",
+            "--source",
+            "all",
+            "--json",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(all.status.success());
+    let stdout = String::from_utf8_lossy(&all.stdout);
+    assert!(
+        stdout.contains("\"reddit_fullname\":\"t3_capsearch\""),
+        "got: {stdout}"
+    );
+    assert!(stdout.contains("\"source\":\"capture\""), "got: {stdout}");
+}
+
+#[test]
+fn binary_search_rejects_invalid_source() {
+    let output = Command::new(binary())
+        .args([
+            "--db-path",
+            &test_db_path(),
+            "search",
+            "x",
+            "--source",
+            "bogus",
+        ])
+        .output()
+        .expect("binary should run");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("invalid --source"), "got: {stderr}");
 }
 
 #[test]

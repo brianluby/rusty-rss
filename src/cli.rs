@@ -7,7 +7,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use rusty_rss_core::config::{Config, DEFAULT_MAX_PAGES, DEFAULT_SYNC_LIMIT};
-use rusty_rss_core::db::SearchFilters;
+use rusty_rss_core::db::{SearchFilters, SearchSource};
 use std::path::PathBuf;
 
 mod enrich;
@@ -21,22 +21,37 @@ mod triage;
 #[cfg(test)]
 mod test_support;
 
-use enrich::run_enrich;
+use enrich::{enrich_options, run_enrich};
 use export::run_export;
 use fts::{FtsCommand, run_fts};
 use read::{run_list, run_search, run_show};
+use rusty_rss_core::enrich as core_enrich;
 use sync::{run_capture, run_sync};
 use tag::run_tag;
 use triage::run_triage;
 
+/// Items requested per page on the no-argument default sync. Distinct from the
+/// explicit `sync` default ([`DEFAULT_SYNC_LIMIT`]) so the convenience path can
+/// evolve independently; happens to share the value today.
+const NO_ARG_SYNC_LIMIT: usize = DEFAULT_SYNC_LIMIT;
+/// Maximum pages fetched by the no-argument default sync. Deliberately smaller
+/// than the explicit `sync` default ([`DEFAULT_MAX_PAGES`]) so a bare invocation
+/// stays bounded and fast.
+const NO_ARG_SYNC_MAX_PAGES: usize = 10;
+
 #[derive(Parser)]
 #[command(
     name = "rusty-rss",
-    about = "Sync Reddit saved posts from RSS/Atom feed to SQLite"
+    about = "Sync Reddit saved posts from RSS/Atom feed to SQLite",
+    long_about = "Sync Reddit saved posts from an RSS/Atom feed into SQLite.\n\n\
+        Run with no subcommand to perform a bounded default sync \
+        (equivalent to `sync --limit 100 --max-pages 10`).",
+    after_help = "With no subcommand, runs a bounded sync \
+        (sync --limit 100 --max-pages 10). Use the `sync` subcommand for full control."
 )]
 pub struct Cli {
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 
     #[arg(long, global = true, env = "RUSTY_RSS_FEED_URL")]
     pub feed_url: Option<String>,
@@ -78,7 +93,7 @@ pub enum Command {
         /// Reddit fullname (e.g., t3_abc123)
         fullname: String,
     },
-    /// Search saved posts by title and markdown content
+    /// Search saved posts, captured pages, and enrichment by full text
     Search {
         /// Full-text search query
         query: String,
@@ -87,6 +102,10 @@ pub enum Command {
         #[arg(short, long, default_value = "20")]
         limit: usize,
 
+        /// Which index to search: posts, capture, enrichment, or all
+        #[arg(long, default_value = "posts")]
+        source: String,
+
         /// Filter by subreddit name without r/
         #[arg(long)]
         subreddit: Option<String>,
@@ -94,6 +113,22 @@ pub enum Command {
         /// Filter by author name without u/
         #[arg(long)]
         author: Option<String>,
+
+        /// Keep only posts that have a successful outbound capture
+        #[arg(long)]
+        has_capture: bool,
+
+        /// Keep only posts that have a successful enrichment run
+        #[arg(long)]
+        has_enrichment: bool,
+
+        /// Filter by latest-enrichment classification, e.g. tool, article
+        #[arg(long)]
+        classification: Option<String>,
+
+        /// Filter by latest-enrichment recommended action, e.g. should_build
+        #[arg(long)]
+        action: Option<String>,
 
         /// Emit newline-delimited JSON records
         #[arg(long)]
@@ -108,6 +143,18 @@ pub enum Command {
         /// Show how many posts would be enriched without calling the LLM or writing rows
         #[arg(long)]
         dry_run: bool,
+
+        /// Maximum LLM requests in flight at once
+        #[arg(long, default_value_t = core_enrich::DEFAULT_CONCURRENCY)]
+        concurrency: usize,
+
+        /// Maximum attempts per item (retries apply only to transient errors)
+        #[arg(long, default_value_t = core_enrich::DEFAULT_RETRY_ATTEMPTS)]
+        retry_attempts: u32,
+
+        /// Re-enrich posts whose newest run is older than this many days
+        #[arg(long)]
+        stale_after_days: Option<u64>,
     },
     /// List triage views from latest enrichment data
     Triage {
@@ -209,7 +256,23 @@ pub async fn run(cli: Cli) -> Result<()> {
         .try_init()
         .ok();
 
-    match cli.command {
+    // A bare invocation (no subcommand) runs a bounded default sync, so the
+    // common case — "pull my latest saved posts" — needs no arguments. The
+    // bounds are intentionally tighter than the explicit `sync` defaults.
+    let command = match cli.command {
+        Some(command) => command,
+        None => {
+            let config = Config::from_env_and_overrides(
+                cli.feed_url,
+                Some(cli.db_path),
+                NO_ARG_SYNC_LIMIT,
+                NO_ARG_SYNC_MAX_PAGES,
+            )?;
+            return run_sync(config).await;
+        }
+    };
+
+    match command {
         Command::Sync { limit, max_pages } => {
             let config =
                 Config::from_env_and_overrides(cli.feed_url, Some(cli.db_path), limit, max_pages)?;
@@ -220,18 +283,54 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Search {
             query,
             limit,
+            source,
             subreddit,
             author,
+            has_capture,
+            has_enrichment,
+            classification,
+            action,
             json,
-        } => run_search(
-            PathBuf::from(cli.db_path),
-            &query,
-            SearchFilters { subreddit, author },
+        } => {
+            let source = SearchSource::parse(&source).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "invalid --source '{source}' (expected posts, capture, enrichment, or all)"
+                )
+            })?;
+            run_search(
+                PathBuf::from(cli.db_path),
+                &query,
+                SearchFilters {
+                    subreddit,
+                    author,
+                    source,
+                    has_capture,
+                    has_enrichment,
+                    classification,
+                    action,
+                },
+                limit,
+                json,
+            )
+        }
+        Command::Enrich {
             limit,
-            json,
-        ),
-        Command::Enrich { limit, dry_run } => {
-            run_enrich(PathBuf::from(cli.db_path), limit, dry_run).await
+            dry_run,
+            concurrency,
+            retry_attempts,
+            stale_after_days,
+        } => {
+            run_enrich(
+                PathBuf::from(cli.db_path),
+                enrich_options(
+                    limit,
+                    dry_run,
+                    concurrency,
+                    retry_attempts,
+                    stale_after_days,
+                ),
+            )
+            .await
         }
         Command::Triage {
             view,
@@ -285,10 +384,10 @@ mod tests {
     async fn run_list_command_does_not_require_feed_url() {
         let db_path = test_db_path();
         let cli = Cli {
-            command: Command::List {
+            command: Some(Command::List {
                 limit: 10,
                 offset: 0,
-            },
+            }),
             feed_url: None,
             db_path: db_path.to_string_lossy().to_string(),
         };
