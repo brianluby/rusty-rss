@@ -19,6 +19,16 @@ rusty-rss --feed-url "https://old.reddit.com/saved.rss?feed=...&user=..." sync
 
 `sync` fails when no feed URL is available. Other commands can read an existing database without the feed URL.
 
+> **Security: prefer `RUSTY_RSS_FEED_URL` over `--feed-url`.**
+> The feed URL embeds a private Reddit `feed` token and `user`. Passing it as a
+> command-line flag exposes it in your shell history and in the process list
+> (`ps`), where any local user can read it. Setting it as the
+> `RUSTY_RSS_FEED_URL` environment variable avoids both leaks. `rusty-rss`
+> additionally redacts the token and user before writing to `sync_runs`
+> (`source_url` and `error` store host+path only) and before returning or
+> logging any sync error, but keeping the raw URL out of your shell history and
+> process list is your responsibility.
+
 ## Choose the Database
 
 The default database path is `./rusty-rss.sqlite3`.

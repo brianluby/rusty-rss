@@ -13,6 +13,13 @@ RUSTY_RSS_FEED_URL="https://old.reddit.com/saved.rss?feed=...&user=..." \
   cargo run -- sync
 ```
 
+> **Security:** the feed URL embeds a private Reddit `feed` token and `user`.
+> Prefer the `RUSTY_RSS_FEED_URL` environment variable over the `--feed-url`
+> flag: a flag value leaks into shell history and the process list (`ps`), and
+> would otherwise be the easiest way to expose your token. `rusty-rss` redacts
+> the token and user from `sync_runs` (`source_url`/`error`) and from any sync
+> error it returns or logs, storing host+path only.
+
 ```bash
 cargo run -- list --limit 20
 cargo run -- search "rust sqlite" --json
