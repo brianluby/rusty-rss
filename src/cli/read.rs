@@ -80,7 +80,9 @@ pub(super) fn run_search(
     json: bool,
 ) -> Result<()> {
     let conn = db::init_db(&db_path)?;
-    let hits = db::search_posts(&conn, query, &filters, limit)?;
+    // The unified multi-source search; `filters.source` (default `posts`) decides
+    // which indexes are consulted, so the post-only default is a zero-regression.
+    let hits = db::search(&conn, query, &filters, limit)?;
 
     if json {
         for hit in hits {
@@ -98,12 +100,13 @@ pub(super) fn run_search(
         let sub = hit.subreddit.as_deref().unwrap_or("(no subreddit)");
         let author = hit.author.as_deref().unwrap_or("(no author)");
         println!(
-            "  {}. [{}] {} by u/{} in r/{}",
+            "  {}. [{}] {} by u/{} in r/{} (matched: {})",
             index + 1,
             hit.reddit_fullname,
             hit.title,
             author,
-            sub
+            sub,
+            hit.source
         );
         println!("     {}", hit.permalink);
         println!("     {}", hit.snippet.trim());
@@ -151,6 +154,7 @@ mod tests {
             SearchFilters {
                 subreddit: Some("rust".to_string()),
                 author: Some("cli_user".to_string()),
+                ..SearchFilters::default()
             },
             10,
             true,

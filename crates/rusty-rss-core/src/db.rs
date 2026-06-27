@@ -29,7 +29,7 @@ pub use export::{ExportFilters, list_export_records};
 pub use posts::{SavedPostRow, UpsertResult, count_posts, get_post, list_posts, upsert_post};
 pub use schema::init_db;
 pub use search::{
-    SearchFilters, SearchHit, fts_integrity_check, rebuild_fts_index, search_multi_source,
+    SearchFilters, SearchHit, SearchSource, fts_integrity_check, rebuild_fts_index, search,
     search_posts,
 };
 pub use tags::{

@@ -248,6 +248,7 @@ impl SearchArgs {
         SearchFilters {
             subreddit: self.subreddit.clone(),
             author: self.author.clone(),
+            ..SearchFilters::default()
         }
     }
 }
