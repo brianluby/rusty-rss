@@ -3,6 +3,7 @@
 use crate::db;
 use crate::models::{PostTag, SavedPost};
 use crate::rules::{CompiledRuleSet, RuleSet};
+use crate::test_support::reset_db_file;
 use rusqlite::Connection;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -15,7 +16,7 @@ pub(crate) fn test_db() -> Connection {
         std::process::id(),
         id
     ));
-    let _ = std::fs::remove_file(&path);
+    reset_db_file(&path);
     db::init_db(&path).expect("db should initialize")
 }
 

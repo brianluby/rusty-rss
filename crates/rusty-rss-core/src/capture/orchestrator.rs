@@ -45,8 +45,18 @@ pub async fn capture_outbound_metadata(
         });
     }
 
-    while let Some(result) = tasks.join_next().await {
-        let (candidate, capture_result) = result.context("capture task failed")?;
+    while let Some(joined) = tasks.join_next().await {
+        let (candidate, capture_result) = match joined {
+            Ok(pair) => pair,
+            Err(join_err) => {
+                // A spawned capture task panicked or was cancelled. Count it as a
+                // single failure and keep draining the rest of the batch instead
+                // of aborting all remaining (and in-flight) work.
+                tracing::warn!(error = %join_err, "capture task failed to join; skipping candidate");
+                summary.failed_count += 1;
+                continue;
+            }
+        };
         match capture_result {
             Ok(metadata) => {
                 db::upsert_outbound_capture(
@@ -101,6 +111,7 @@ mod tests {
     use super::*;
     use crate::capture::test_support::{serve_concurrent_html, serve_html};
     use crate::models::SavedPost;
+    use crate::test_support::reset_db_file;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[tokio::test]
@@ -110,7 +121,7 @@ mod tests {
             std::process::id(),
             1
         ));
-        let _ = std::fs::remove_file(&db_path);
+        reset_db_file(&db_path);
         let conn = db::init_db(&db_path).expect("db should init");
         let url = serve_html("<html><head><title>Captured page</title></head></html>");
         let mut post = SavedPost::new(
@@ -160,7 +171,7 @@ mod tests {
             std::process::id(),
             1
         ));
-        let _ = std::fs::remove_file(&db_path);
+        reset_db_file(&db_path);
         let conn = db::init_db(&db_path).expect("db should init");
         let current = Arc::new(AtomicUsize::new(0));
         let max_seen = Arc::new(AtomicUsize::new(0));

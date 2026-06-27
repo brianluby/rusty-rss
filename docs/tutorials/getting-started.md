@@ -4,7 +4,7 @@ This tutorial walks through a first local archive: sync saved Reddit items, insp
 
 ## Prerequisites
 
-- Rust toolchain compatible with the workspace `rust-version` of `1.85`.
+- Rust toolchain compatible with the workspace `rust-version` of `1.88`.
 - A Reddit saved-items feed URL, such as `https://old.reddit.com/saved.rss?feed=...&user=...`.
 
 The feed URL is only needed for `sync`. Read-only commands can run against an existing database without it.

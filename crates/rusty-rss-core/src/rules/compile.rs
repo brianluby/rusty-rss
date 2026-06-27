@@ -118,7 +118,16 @@ impl RuleSet {
                 if !weight.is_finite() {
                     bail!("topic '{name}': subreddit_prior['{subreddit}'] must be finite");
                 }
-                subreddit_prior.insert(subreddit.to_lowercase(), *weight);
+                let normalized = subreddit.to_lowercase();
+                if subreddit_prior
+                    .insert(normalized.clone(), *weight)
+                    .is_some()
+                {
+                    bail!(
+                        "topic '{name}': duplicate subreddit_prior entry '{normalized}' after \
+                         case-normalization"
+                    );
+                }
             }
             topics.push(CompiledTopic {
                 name: name.clone(),
@@ -279,6 +288,26 @@ rules = [
 "#;
         let err = RuleSet::from_toml(toml).expect_err("duplicate rule id should fail");
         assert!(format!("{err:#}").contains("duplicate rule id"));
+    }
+
+    #[test]
+    fn rejects_case_only_duplicate_subreddit_prior() {
+        // "Rust" and "rust" are distinct TOML keys but collapse to the same key
+        // after lowercase normalization; merging them silently would drop one
+        // weight, so compilation must fail instead.
+        let toml = r#"
+[meta]
+version = "v"
+[topics.t]
+threshold = 1.0
+rules = [{ id = "r", signal = "title", kind = "fts", match = "a" }]
+[topics.t.subreddit_prior]
+Rust = 1.0
+rust = 2.0
+"#;
+        let err =
+            RuleSet::from_toml(toml).expect_err("case-only duplicate subreddit_prior should fail");
+        assert!(format!("{err:#}").contains("subreddit_prior"));
     }
 
     #[test]

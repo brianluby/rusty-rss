@@ -1,6 +1,28 @@
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
+
+/// Remove a stale test database and its SQLite sidecars so a reused temp path
+/// never inherits data from an earlier run. Covers the default rollback-journal
+/// mode (`-journal`) and WAL mode (`-wal`/`-shm`) so it stays correct regardless
+/// of the connection's journal_mode. A missing file is fine; any other I/O error
+/// is surfaced rather than silently ignored.
+pub(crate) fn reset_db_file(path: &Path) {
+    for suffix in ["", "-journal", "-wal", "-shm"] {
+        let mut target = path.as_os_str().to_owned();
+        target.push(suffix);
+        let target = PathBuf::from(target);
+        match std::fs::remove_file(&target) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => panic!(
+                "failed to remove stale test db file {}: {err}",
+                target.display()
+            ),
+        }
+    }
+}
 
 pub(crate) fn serve_json_responses(responses: Vec<String>) -> (String, mpsc::Receiver<String>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("server should bind");
