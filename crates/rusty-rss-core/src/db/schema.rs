@@ -3,10 +3,17 @@
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 use std::path::Path;
+use std::time::Duration;
 
 pub fn init_db(db_path: &Path) -> Result<Connection> {
     let conn = Connection::open(db_path)
         .context(format!("failed to open database at {}", db_path.display()))?;
+
+    // Wait on a contended write lock instead of failing immediately with
+    // SQLITE_BUSY, so the IMMEDIATE transaction in `upsert_post` queues behind a
+    // concurrent writer rather than erroring.
+    conn.busy_timeout(Duration::from_secs(5))
+        .context("failed to configure busy timeout")?;
 
     // SQLite leaves foreign keys off by default and the setting is per
     // connection, so enable it before any access for the schema's FK
@@ -370,6 +377,18 @@ mod tests {
         assert!(
             result.is_err(),
             "insert referencing a missing saved_post should violate the FK"
+        );
+    }
+
+    #[test]
+    fn init_db_configures_busy_timeout() {
+        let conn = init_db(&unique_db_path("busy")).expect("init should succeed");
+        let timeout: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .expect("busy_timeout should query");
+        assert!(
+            timeout >= 1000,
+            "a busy timeout should be configured so writers queue, got {timeout}"
         );
     }
 
