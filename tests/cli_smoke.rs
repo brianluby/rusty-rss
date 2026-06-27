@@ -263,6 +263,108 @@ fn binary_search_rejects_invalid_source() {
 }
 
 #[test]
+fn binary_search_rejects_invalid_classification() {
+    let output = Command::new(binary())
+        .args([
+            "--db-path",
+            &test_db_path(),
+            "search",
+            "x",
+            "--classification",
+            "bogus",
+        ])
+        .output()
+        .expect("binary should run");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unknown classification: bogus"),
+        "got: {stderr}"
+    );
+}
+
+#[test]
+fn binary_search_rejects_invalid_action() {
+    let output = Command::new(binary())
+        .args([
+            "--db-path",
+            &test_db_path(),
+            "search",
+            "x",
+            "--action",
+            "bogus",
+        ])
+        .output()
+        .expect("binary should run");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unknown recommended_action: bogus"),
+        "got: {stderr}"
+    );
+}
+
+#[test]
+fn binary_search_accepts_valid_classification_and_action() {
+    // A valid --classification / --action must pass validation and return the
+    // matching enriched post (proving the canonical value still reaches the
+    // query layer after the FromStr round-trip).
+    let db_path = test_db_path();
+    let conn = db::init_db(std::path::Path::new(&db_path)).expect("db should initialize");
+    let mut post = SavedPost::new(
+        "t3_search_filter".to_string(),
+        "Filterable Item".to_string(),
+        "https://reddit.com/r/rust/comments/search_filter/item/".to_string(),
+        "atom".to_string(),
+    );
+    post.content_markdown = Some("filterable markdown body".to_string());
+    db::upsert_post(&conn, &post).expect("post should insert");
+    db::record_enrichment_success(
+        &conn,
+        "t3_search_filter",
+        "test",
+        "test-model",
+        "test-prompt",
+        "raw",
+        &EnrichmentOutput {
+            classification: Classification::Tool,
+            tags: vec!["rust".to_string()],
+            summary: "Useful".to_string(),
+            joy_value: 0.2,
+            work_value: 0.8,
+            recommended_action: RecommendedAction::ShouldBuild,
+            rationale: "Build it".to_string(),
+            confidence: 0.9,
+        },
+    )
+    .expect("enrichment should insert");
+
+    let output = Command::new(binary())
+        .args([
+            "--db-path",
+            &db_path,
+            "search",
+            "filterable",
+            "--json",
+            "--classification",
+            "tool",
+            "--action",
+            "should_build",
+        ])
+        .output()
+        .expect("binary should run");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("\"reddit_fullname\":\"t3_search_filter\""),
+        "got: {stdout}"
+    );
+}
+
+#[test]
 fn binary_export_jsonl_outputs_agent_records() {
     let db_path = test_db_path();
     let conn = db::init_db(std::path::Path::new(&db_path)).expect("db should initialize");

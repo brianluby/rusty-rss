@@ -35,7 +35,13 @@ impl EnrichError {
     /// and `Validation` are deterministic given the same prompt and input, so
     /// retrying them just burns the budget — fail fast instead.
     pub fn is_transient(&self) -> bool {
-        matches!(self, Self::Transport(_) | Self::ModelUnavailable(_))
+        // Exhaustive on purpose: a new variant must make a deliberate
+        // retryable/terminal decision here rather than defaulting to
+        // non-retryable behind a `matches!` wildcard.
+        match self {
+            Self::Transport(_) | Self::ModelUnavailable(_) => true,
+            Self::Parse(_) | Self::Validation(_) => false,
+        }
     }
 }
 

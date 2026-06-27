@@ -8,7 +8,9 @@ use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use rusty_rss_core::config::{Config, DEFAULT_MAX_PAGES, DEFAULT_SYNC_LIMIT};
 use rusty_rss_core::db::{SearchFilters, SearchSource};
+use rusty_rss_core::models::{Classification, RecommendedAction};
 use std::path::PathBuf;
+use std::str::FromStr;
 
 mod enrich;
 mod export;
@@ -297,6 +299,24 @@ pub async fn run(cli: Cli) -> Result<()> {
                     "invalid --source '{source}' (expected posts, capture, enrichment, or all)"
                 )
             })?;
+            // Validate --classification / --action up front via their FromStr
+            // impls (mirroring how --source is checked). Without this an
+            // unrecognized value flows straight into the SQL filter and silently
+            // returns 0 results instead of a clear error. Re-serialize the parsed
+            // enum to its canonical string so SearchFilters still holds the
+            // String the query layer expects.
+            let classification = classification
+                .as_deref()
+                .map(Classification::from_str)
+                .transpose()
+                .map_err(|err| anyhow::anyhow!(err))?
+                .map(|c| c.as_str().to_string());
+            let action = action
+                .as_deref()
+                .map(RecommendedAction::from_str)
+                .transpose()
+                .map_err(|err| anyhow::anyhow!(err))?
+                .map(|a| a.as_str().to_string());
             run_search(
                 PathBuf::from(cli.db_path),
                 &query,

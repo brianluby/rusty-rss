@@ -174,6 +174,17 @@ async fn enrich_with_retries<P: LlmProvider + ?Sized>(
     let attempts = options.retry_attempts.max(1);
     let mut last_error = String::new();
 
+    // Deterministic per-task jitter so concurrent workers don't retry a shared
+    // transient fault in lockstep. Derived from the post's fullname (already in
+    // scope) rather than a new `rand` dependency: stable within a run, but
+    // staggered across tasks. Bounded to <100ms so it never dominates the linear
+    // 100ms * attempt backoff below.
+    let jitter_ms = u64::from(
+        post.reddit_fullname
+            .bytes()
+            .fold(0u8, |acc, b| acc.wrapping_add(b)),
+    ) % 100;
+
     for attempt in 1..=attempts {
         match tokio::time::timeout(options.per_item_timeout, provider.enrich(post)).await {
             Ok(Ok(result)) => return Ok(result),
@@ -192,7 +203,7 @@ async fn enrich_with_retries<P: LlmProvider + ?Sized>(
         }
 
         if attempt < attempts {
-            tokio::time::sleep(Duration::from_millis(100 * u64::from(attempt))).await;
+            tokio::time::sleep(Duration::from_millis(100 * u64::from(attempt) + jitter_ms)).await;
         }
     }
 

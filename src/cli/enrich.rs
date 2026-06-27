@@ -16,6 +16,15 @@ pub(super) async fn run_enrich(db_path: PathBuf, options: EnrichOptions) -> Resu
     // the extra read is negligible for a CLI and keeps the batch self-contained.
     // Using the shared selector keeps the dry-run count and the batch in sync,
     // including the prompt-version and staleness gating.
+    //
+    // Known asymmetry: this first selection only gates the empty-batch
+    // short-circuit and the provider preflight. If it sees N>0 (so we pay the
+    // preflight) but a concurrent sync/enrich drains all N before the batch
+    // re-selects, the run prints "0 selected" after already paying the preflight
+    // cost. This is benign at personal-archive scale (the preflight is a cheap
+    // local-LLM probe) but can look misleading in a cron/daemon context. Left
+    // as-is to keep the batch the single authoritative selector; consolidating
+    // would mean threading candidates or the provider across the API boundary.
     let candidates = enrich::select_candidates(&conn, options)?;
 
     if options.dry_run {
