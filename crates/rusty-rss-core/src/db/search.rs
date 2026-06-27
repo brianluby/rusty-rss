@@ -86,6 +86,51 @@ pub fn search_posts(
         .context("failed to collect search results")
 }
 
+/// Unconditionally rebuild the `posts_fts` index from `saved_posts`.
+///
+/// `posts_fts` is an external-content FTS5 table over
+/// `saved_posts(title, content_markdown)` with `content_rowid='rowid'`, so every
+/// indexed document is keyed by its `saved_posts.rowid`. The `'rebuild'` command
+/// discards the index and reconstructs it from that content table, repairing any
+/// drift left by missed triggers or manual edits. Unlike `rebuild_stale_fts_index`
+/// (which runs only inside `init_db` and skips when counts already match), this is
+/// the maintenance entry point and always rebuilds.
+pub fn rebuild_fts_index(conn: &Connection) -> Result<()> {
+    conn.execute("INSERT INTO posts_fts(posts_fts) VALUES ('rebuild')", [])
+        .context("failed to rebuild full-text search index")?;
+    Ok(())
+}
+
+/// Verify the `posts_fts` index is internally consistent and matches its
+/// `saved_posts` content table.
+///
+/// Runs the FTS5 `'integrity-check'` command. A structurally sound index returns
+/// `Ok`; a corrupt or drifted one surfaces SQLite's `SQLITE_CORRUPT_VTAB`, which
+/// is mapped to a clear error pointing at [`rebuild_fts_index`] for recovery. Any
+/// other database failure is propagated with context rather than swallowed.
+pub fn fts_integrity_check(conn: &Connection) -> Result<()> {
+    match conn.execute(
+        "INSERT INTO posts_fts(posts_fts) VALUES ('integrity-check')",
+        [],
+    ) {
+        Ok(_) => Ok(()),
+        Err(err) if is_fts_corruption(&err) => Err(anyhow!(
+            "full-text search index failed its integrity check (corruption or drift \
+             detected); rebuild it to recover: {err}"
+        )),
+        Err(err) => Err(err).context("failed to run full-text search integrity check"),
+    }
+}
+
+/// Whether a rusqlite error is an FTS5 corruption signal (`SQLITE_CORRUPT` and its
+/// `SQLITE_CORRUPT_VTAB` extension both map to the `DatabaseCorrupt` primary code).
+fn is_fts_corruption(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(e, _) if e.code == rusqlite::ErrorCode::DatabaseCorrupt
+    )
+}
+
 fn normalize_fts_query(query: &str) -> Result<String> {
     let mut parts = Vec::new();
     let mut current = String::new();
@@ -267,5 +312,128 @@ mod tests {
         let err = search_posts(&conn, "\"unterminated", &SearchFilters::default(), 10)
             .expect_err("malformed query should fail");
         assert!(err.to_string().contains("invalid search query"));
+    }
+
+    /// Battery of stable search terms exercised before and after a rebuild. Every
+    /// term is present in the deterministic fixtures below regardless of the
+    /// random token suffix, so the result set is comparable across rebuilds.
+    const REBUILD_QUERIES: &[&str] = &[
+        "seq", "title", "body", "alpha0", "alpha1", "alpha2", "alpha3", "alpha4", "alpha5",
+        "beta0", "beta1", "beta2", "beta3", "beta4", "beta5",
+    ];
+
+    /// Snapshot the trigger-maintained search results across the query battery as
+    /// comparable `(query, [fullname|rank])` rows. Rank is formatted to a fixed
+    /// precision so the trigger-maintained and freshly rebuilt indexes compare by
+    /// value even though `SearchHit` is not `PartialEq`.
+    fn search_snapshot(conn: &Connection) -> Vec<(String, Vec<String>)> {
+        REBUILD_QUERIES
+            .iter()
+            .map(|query| {
+                let hits = search_posts(conn, query, &SearchFilters::default(), 100)
+                    .expect("snapshot search should succeed");
+                let rows = hits
+                    .iter()
+                    .map(|hit| format!("{}|{:.6}", hit.reddit_fullname, hit.rank))
+                    .collect();
+                ((*query).to_string(), rows)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn maintained_index_matches_rebuild_after_random_mutations() {
+        let conn = test_db();
+
+        // Tiny deterministic LCG (no `rand` dependency) so the upsert/delete
+        // sequence is reproducible. Constants are the well-known PCG/MMIX values.
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as u32
+        };
+
+        // Churn a small pool of rows so inserts, updates, and deletes interleave
+        // and the FTS triggers (ai/ad/au) all fire repeatedly.
+        const POOL: u32 = 6;
+        for _ in 0..200 {
+            let idx = next() % POOL;
+            let fullname = format!("t3_seq_{idx}");
+            if next() % 3 == 2 {
+                conn.execute(
+                    "DELETE FROM saved_posts WHERE reddit_fullname = ?",
+                    params![fullname],
+                )
+                .expect("delete should succeed");
+            } else {
+                let token = next() % 1000;
+                let mut post = test_post();
+                post.reddit_fullname = fullname;
+                post.reddit_id = format!("seq{idx}");
+                post.title = format!("seq title alpha{idx} term{token}");
+                post.content_markdown = Some(format!("seq body beta{idx} word{token}"));
+                upsert_post(&conn, &post).expect("upsert should succeed");
+            }
+        }
+
+        // The trigger-maintained index must already be internally consistent.
+        fts_integrity_check(&conn).expect("maintained index should pass integrity check");
+
+        // An unconditional rebuild reconstructs the index from `saved_posts`
+        // alone; if the triggers kept it faithful, the result set is identical.
+        let before = search_snapshot(&conn);
+        rebuild_fts_index(&conn).expect("rebuild should succeed");
+        let after = search_snapshot(&conn);
+
+        assert_eq!(
+            before, after,
+            "trigger-maintained index must match a freshly rebuilt one"
+        );
+        fts_integrity_check(&conn).expect("rebuilt index should pass integrity check");
+    }
+
+    #[test]
+    fn rebuild_restores_drifted_index() {
+        let conn = test_db();
+        let mut post = test_post();
+        post.reddit_fullname = "t3_drift".to_string();
+        post.reddit_id = "drift".to_string();
+        post.title = "Zebra drift title".to_string();
+        post.content_markdown = Some("zebra drift body".to_string());
+        upsert_post(&conn, &post).expect("post should insert");
+
+        let baseline = search_posts(&conn, "zebra", &SearchFilters::default(), 10)
+            .expect("baseline search should succeed");
+        assert_eq!(baseline.len(), 1, "precondition: post is indexed");
+
+        // Deliberately desync the index: remove the post's FTS entry via the FTS5
+        // special 'delete' syntax while leaving the `saved_posts` row in place, so
+        // the index drifts (a document missing relative to the content table).
+        // This depends on the FTS rowid mirroring `saved_posts.rowid`.
+        conn.execute(
+            "INSERT INTO posts_fts(posts_fts, rowid, title, content_markdown)
+             SELECT 'delete', rowid, title, content_markdown
+             FROM saved_posts WHERE reddit_fullname = 't3_drift'",
+            [],
+        )
+        .expect("desync should succeed");
+
+        let drifted = search_posts(&conn, "zebra", &SearchFilters::default(), 10)
+            .expect("drifted search should succeed");
+        assert!(
+            drifted.is_empty(),
+            "drift is observable: maintained index no longer matches the table"
+        );
+
+        // The unconditional rebuild restores maintained == rebuilt.
+        rebuild_fts_index(&conn).expect("rebuild should succeed");
+        let restored = search_posts(&conn, "zebra", &SearchFilters::default(), 10)
+            .expect("restored search should succeed");
+        assert_eq!(restored.len(), 1, "rebuild repairs the drifted index");
+        assert_eq!(restored[0].reddit_fullname, "t3_drift");
+
+        fts_integrity_check(&conn).expect("integrity check should pass after rebuild");
     }
 }

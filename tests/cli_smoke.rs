@@ -380,6 +380,41 @@ fn binary_tag_missing_rules_file_errors() {
 }
 
 #[test]
+fn binary_fts_subcommand_is_hidden_but_runs() {
+    let db_path = test_db_path();
+
+    // The `fts` maintenance command is hidden: it must not appear in top-level help.
+    let help = Command::new(binary())
+        .arg("--help")
+        .output()
+        .expect("binary should run");
+    assert!(help.status.success());
+    let help_stdout = String::from_utf8_lossy(&help.stdout);
+    assert!(
+        !help_stdout.contains("fts"),
+        "hidden fts command should not appear in help: {help_stdout}"
+    );
+
+    // The nested `fts check` subcommand still works and reports OK on a fresh db.
+    let check = Command::new(binary())
+        .args(["--db-path", &db_path, "fts", "check"])
+        .output()
+        .expect("binary should run");
+    assert!(check.status.success());
+    let check_stdout = String::from_utf8_lossy(&check.stdout);
+    assert!(check_stdout.contains("OK"), "got: {check_stdout}");
+
+    // The nested `fts rebuild` subcommand also runs cleanly.
+    let rebuild = Command::new(binary())
+        .args(["--db-path", &db_path, "fts", "rebuild"])
+        .output()
+        .expect("binary should run");
+    assert!(rebuild.status.success());
+    let rebuild_stdout = String::from_utf8_lossy(&rebuild.stdout);
+    assert!(rebuild_stdout.contains("rebuilt"), "got: {rebuild_stdout}");
+}
+
+#[test]
 fn binary_enrich_dry_run_does_not_require_valid_llm_config() {
     let output = Command::new(binary())
         .args(["--db-path", &test_db_path(), "enrich", "--dry-run"])
