@@ -7,15 +7,54 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use url::Url;
 
-pub fn build_capture_client(user_agent: &str, allow_private_hosts: bool) -> Client {
-    Client::builder()
+/// A reqwest [`Client`] wired with the SSRF guard: the DNS-rebinding-safe
+/// [`GuardedResolver`], a no-redirect policy, and `no_proxy` so requests cannot
+/// be tunnelled around the resolver. It is the only client type the capture
+/// fetch functions accept, so a caller cannot substitute an unguarded client and
+/// bypass these protections.
+///
+/// The `allow_private_hosts` policy is captured here at build time and is the
+/// single source of truth: the capture fns derive the [`validate_capture_url`]
+/// pre-check flag from it rather than taking a separate parameter, so the
+/// pre-check policy and the resolver policy can never diverge (a divergence
+/// would re-open the DNS-rebinding window the resolver exists to close).
+#[derive(Debug, Clone)]
+pub struct CaptureClient {
+    client: Client,
+    allow_private_hosts: bool,
+}
+
+impl CaptureClient {
+    /// Borrow the guarded client to issue a request. Crate-internal only: the
+    /// newtype is opaque to external callers by design.
+    pub(super) fn inner(&self) -> &Client {
+        &self.client
+    }
+
+    /// The SSRF policy baked into this client, used to drive the per-request
+    /// [`validate_capture_url`] pre-check so it always matches the resolver.
+    pub(super) fn allow_private_hosts(&self) -> bool {
+        self.allow_private_hosts
+    }
+}
+
+pub fn build_capture_client(user_agent: &str, allow_private_hosts: bool) -> CaptureClient {
+    let client = Client::builder()
         .user_agent(user_agent)
         .redirect(Policy::none())
+        // Ignore ambient/system proxy settings: a configured proxy could
+        // tunnel the request around GuardedResolver and reach a private
+        // host. Security features fail closed.
+        .no_proxy()
         .dns_resolver(Arc::new(GuardedResolver {
             allow_private_hosts,
         }))
         .build()
-        .expect("reqwest client build should not fail")
+        .expect("reqwest client build should not fail");
+    CaptureClient {
+        client,
+        allow_private_hosts,
+    }
 }
 
 /// DNS resolver that drops private/loopback addresses at resolution time, so the
@@ -98,11 +137,35 @@ pub(super) async fn validate_capture_url(url: &str, allow_private_hosts: bool) -
     Ok(())
 }
 
+/// Extract the embedded IPv4 from a well-known NAT64 address (`64:ff9b::/96`,
+/// RFC 6052). On NAT64 networks such an address routes to that IPv4, so an
+/// embedded private/loopback target (e.g. `64:ff9b::7f00:1` = 127.0.0.1) must be
+/// checked as the IPv4 it maps to rather than slipping through the IPv6 branch.
+fn ipv4_from_nat64_well_known(ip: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    let segments = ip.segments();
+    if segments[0] == 0x0064
+        && segments[1] == 0xff9b
+        && segments[2..6].iter().all(|segment| *segment == 0)
+    {
+        return Some(std::net::Ipv4Addr::new(
+            (segments[6] >> 8) as u8,
+            segments[6] as u8,
+            (segments[7] >> 8) as u8,
+            segments[7] as u8,
+        ));
+    }
+    None
+}
+
 fn is_blocked_ip(ip: IpAddr) -> bool {
-    // Normalize IPv4-mapped IPv6 (e.g. ::ffff:127.0.0.1) to IPv4 so an embedded
-    // private/loopback address cannot slip through the IPv6 branch.
+    // Normalize embedded IPv4 (IPv4-mapped IPv6 like ::ffff:127.0.0.1, and the
+    // well-known NAT64 prefix 64:ff9b::/96) to IPv4 so a private/loopback target
+    // cannot slip through the IPv6 branch.
     let ip = match ip {
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+        IpAddr::V6(v6) => match v6
+            .to_ipv4_mapped()
+            .or_else(|| ipv4_from_nat64_well_known(v6))
+        {
             Some(v4) => IpAddr::V4(v4),
             None => IpAddr::V6(v6),
         },
@@ -110,16 +173,22 @@ fn is_blocked_ip(ip: IpAddr) -> bool {
     };
     match ip {
         IpAddr::V4(ip) => {
-            let [a, b, _, _] = ip.octets();
+            let [a, b, c, _] = ip.octets();
             ip.is_private()
                 || ip.is_loopback()
                 || ip.is_link_local()
                 || ip.is_multicast()
                 || ip.is_broadcast()
                 || ip.is_documentation()
-                || ip.is_unspecified()
+                // "This network" / unspecified, 0.0.0.0/8 (subsumes 0.0.0.0).
+                || a == 0
                 // CGNAT / shared address space, 100.64.0.0/10.
                 || (a == 100 && (64..=127).contains(&b))
+                // IETF protocol assignments, 192.0.0.0/24 (incl. DS-Lite and the
+                // 192.0.0.170/171 NAT64 well-known addresses).
+                || (a == 192 && b == 0 && c == 0)
+                // Deprecated 6to4 relay anycast, 192.88.99.0/24.
+                || (a == 192 && b == 88 && c == 99)
                 // Benchmarking, 198.18.0.0/15.
                 || (a == 198 && (b == 18 || b == 19))
                 // Reserved (incl. future use), 240.0.0.0/4.
@@ -189,6 +258,13 @@ mod tests {
             "198.18.0.1",       // benchmarking 198.18.0.0/15
             "240.0.0.1",        // reserved 240.0.0.0/4
             "224.0.0.1",        // IPv4 multicast 224.0.0.0/4
+            "0.0.0.0",          // unspecified (still blocked after folding into 0.0.0.0/8)
+            "0.1.2.3",          // "this network" 0.0.0.0/8 (not just the 0.0.0.0 unspecified addr)
+            "192.0.0.1",        // IETF protocol assignments 192.0.0.0/24
+            "192.0.0.170",      // NAT64 well-known address in 192.0.0.0/24
+            "192.88.99.1",      // deprecated 6to4 relay anycast 192.88.99.0/24
+            "64:ff9b::7f00:1",  // NAT64 64:ff9b::/96 embedding 127.0.0.1
+            "64:ff9b::a00:1",   // NAT64 64:ff9b::/96 embedding 10.0.0.1
         ];
         for addr in blocked {
             assert!(
@@ -201,6 +277,7 @@ mod tests {
             "1.1.1.1",              // public IPv4
             "2606:4700:4700::1111", // public IPv6
             "::ffff:1.1.1.1",       // IPv4-mapped public
+            "64:ff9b::101:101",     // NAT64 64:ff9b::/96 embedding 1.1.1.1 (public)
         ];
         for addr in allowed {
             assert!(
