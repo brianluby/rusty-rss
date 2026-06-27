@@ -12,6 +12,7 @@ use std::path::PathBuf;
 
 mod enrich;
 mod export;
+mod fts;
 mod read;
 mod sync;
 mod tag;
@@ -22,6 +23,7 @@ mod test_support;
 
 use enrich::run_enrich;
 use export::run_export;
+use fts::{FtsCommand, run_fts};
 use read::{run_list, run_search, run_show};
 use sync::{run_capture, run_sync};
 use tag::run_tag;
@@ -182,6 +184,13 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Maintain all full-text search indexes: posts, captures, enrichment
+    /// (rebuild / integrity check)
+    #[command(hide = true)]
+    Fts {
+        #[command(subcommand)]
+        command: FtsCommand,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -263,6 +272,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             dry_run,
             json,
         ),
+        Command::Fts { command } => run_fts(PathBuf::from(cli.db_path), command),
     }
 }
 

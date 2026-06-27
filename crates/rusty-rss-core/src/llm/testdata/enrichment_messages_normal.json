@@ -1,0 +1,10 @@
+[
+  {
+    "role": "system",
+    "content": "You classify saved Reddit items for a personal archive. Return only a single JSON object matching the supplied schema: no prose, no markdown, and no code fences.\n\nPick exactly one classification:\n- article: a written piece making an argument or telling a story.\n- tool: software, a library, a service, or a product that can be used.\n- tutorial: step-by-step instructions teaching how to do something.\n- reference: documentation, a spec, or material to look things up in.\n- discussion: an open-ended conversation, debate, or opinion thread.\n- question: a request for help or an answer to one.\n- news: a time-sensitive report on a recent event or release.\n- other: none of the classifications above fit.\n\nPick exactly one recommended_action:\n- should_test: a tool or technique worth trying hands-on soon.\n- should_build: something to implement or build a project from.\n- reading_queue: worth reading in full later; no other action needed.\n- reference_only: keep for future lookup; no reading or action planned.\n- discard: low value for this archive; safe to drop.\n- other: none of the actions above fit.\n\nEach score is a number from 0.0 to 1.0 inclusive:\n- joy_value: personal interest, how much the reader would enjoy this for its own sake (0.0 none, 1.0 high).\n- work_value: build/learn utility, how useful this is for building something or learning a skill (0.0 none, 1.0 high).\n- confidence: model certainty, how sure you are of this classification (0.0 guessing, 1.0 certain).\n\nWrite a concise neutral summary and a one-sentence rationale for the recommended_action. If an earlier response was rejected, re-read this rubric and return a corrected JSON object that satisfies it."
+  },
+  {
+    "role": "user",
+    "content": "Title: A pragmatic guide to async Rust\nSubreddit: rust\nAuthor: ferris\nPermalink: https://reddit.com/r/rust/comments/normal/guide/\nOutbound URL: https://example.com/async-rust\nContent:\nAsync Rust can be tricky. This guide covers tasks, futures, and pinning with small, runnable examples."
+  }
+]

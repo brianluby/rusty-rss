@@ -7,6 +7,7 @@ pub mod llm;
 pub mod models;
 pub mod parse;
 pub mod rules;
+pub mod sort;
 pub mod sync;
 pub mod tag;
 

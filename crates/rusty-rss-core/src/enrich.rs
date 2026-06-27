@@ -1,10 +1,9 @@
 use crate::db;
+use crate::llm::prompt::PROMPT_VERSION;
 use crate::llm::{EnrichmentResult, LlmProvider};
 use anyhow::Result;
 use rusqlite::Connection;
 use std::time::Duration;
-
-pub const PROMPT_VERSION: &str = "enrich-v1";
 
 #[derive(Debug, Clone, Copy)]
 pub struct EnrichOptions {

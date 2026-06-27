@@ -54,7 +54,7 @@ Append-only enrichment attempts for saved posts.
 | `reddit_fullname` | Saved post foreign key. |
 | `provider` | Provider label, such as `openai-compatible`. |
 | `model` | Model ID used for the attempt. |
-| `prompt_version` | Prompt contract version, currently `enrich-v1`. |
+| `prompt_version` | Prompt contract version, e.g. `enrich-v2`. |
 | `status` | `success` or `error`. |
 | `raw_response` | Raw model response content for successful attempts. |
 | `classification` | Normalized classification. |

@@ -1,3 +1,6 @@
+pub(crate) mod prompt;
+
+use self::prompt::ChatMessage;
 use crate::models::{EnrichmentOutput, SavedPost};
 use reqwest::Client;
 use schemars::schema_for;
@@ -128,8 +131,8 @@ impl OpenAiProvider {
     }
 
     async fn enrich_post(&self, post: &SavedPost) -> EnrichResult<EnrichmentResult> {
-        let messages = enrichment_messages(post);
-        let raw_response = self.chat_completion(messages.clone()).await?;
+        let messages = prompt::build_enrichment_messages(post, prompt::MAX_CONTENT_CHARS);
+        let raw_response = self.chat_completion(messages).await?;
 
         match parse_enrichment_output(&raw_response) {
             Ok(output) => Ok(EnrichmentResult {
@@ -138,7 +141,7 @@ impl OpenAiProvider {
             }),
             Err(first_err) => {
                 let repaired_response = self
-                    .chat_completion(repair_messages(post, &raw_response))
+                    .chat_completion(prompt::build_repair_messages(post, &raw_response))
                     .await?;
                 let output = parse_enrichment_output(&repaired_response).map_err(|second_err| {
                     EnrichError::Parse(format!("{first_err}; repair failed: {second_err}"))
@@ -230,12 +233,6 @@ struct ChatCompletionRequest {
     response_format: Value,
 }
 
-#[derive(Debug, Serialize, Clone)]
-struct ChatMessage {
-    role: &'static str,
-    content: String,
-}
-
 #[derive(Debug, Deserialize)]
 struct ChatCompletionResponse {
     choices: Vec<ChatChoice>,
@@ -271,38 +268,6 @@ fn normalize_base_url(base_url: &str) -> EnrichResult<Url> {
     }
 
     Ok(base_url)
-}
-
-fn enrichment_messages(post: &SavedPost) -> Vec<ChatMessage> {
-    vec![
-        ChatMessage {
-            role: "system",
-            content: "You classify saved Reddit items for a personal archive. Return only JSON matching the supplied schema.".to_string(),
-        },
-        ChatMessage {
-            role: "user",
-            content: format!(
-                "Title: {}\nSubreddit: {}\nAuthor: {}\nPermalink: {}\nOutbound URL: {}\nContent:\n{}",
-                post.title,
-                post.subreddit.as_deref().unwrap_or(""),
-                post.author.as_deref().unwrap_or(""),
-                post.permalink,
-                post.outbound_url.as_deref().unwrap_or(""),
-                post.content_markdown.as_deref().unwrap_or("")
-            ),
-        },
-    ]
-}
-
-fn repair_messages(post: &SavedPost, invalid_response: &str) -> Vec<ChatMessage> {
-    let mut messages = enrichment_messages(post);
-    messages.push(ChatMessage {
-        role: "user",
-        content: format!(
-            "The previous response was invalid JSON or failed validation. Return a corrected JSON object only. Previous response:\n{invalid_response}"
-        ),
-    });
-    messages
 }
 
 fn parse_enrichment_output(raw_response: &str) -> std::result::Result<EnrichmentOutput, String> {

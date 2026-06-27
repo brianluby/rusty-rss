@@ -86,6 +86,168 @@ pub fn search_posts(
         .context("failed to collect search results")
 }
 
+/// Every external-content FTS5 index in the schema, each keyed to its content
+/// table by `rowid`: `posts_fts` over `saved_posts`, `capture_fts` over
+/// `outbound_captures`, and `enrichment_fts` over `enrichment_runs`. The
+/// maintenance helpers below operate on all of them so a `rebuild`/`check` keeps
+/// the whole search subsystem (incl. the multi-source aux indexes) consistent,
+/// not just post search. Names are compile-time constants — never user input —
+/// so interpolating them into the FTS command statements is safe.
+const FTS_INDEXES: [&str; 3] = ["posts_fts", "capture_fts", "enrichment_fts"];
+
+/// Unconditionally rebuild every FTS index from its content table.
+///
+/// Each index is external-content (`content=...`, `content_rowid='rowid'`), so
+/// the `'rebuild'` command discards the index and reconstructs it from the
+/// content table, repairing any drift left by missed triggers or manual edits.
+/// Unlike `rebuild_stale_fts_index` (which runs only inside `init_db` and skips
+/// when counts already match), this is the maintenance entry point and always
+/// rebuilds all of [`FTS_INDEXES`].
+pub fn rebuild_fts_index(conn: &Connection) -> Result<()> {
+    for index in FTS_INDEXES {
+        conn.execute(
+            &format!("INSERT INTO {index}({index}) VALUES ('rebuild')"),
+            [],
+        )
+        .with_context(|| format!("failed to rebuild full-text search index {index}"))?;
+    }
+    Ok(())
+}
+
+/// Verify every FTS index is internally consistent and matches its content table.
+///
+/// Runs the FTS5 `'integrity-check'` command in its `rank = 1` form
+/// (`VALUES ('integrity-check', 1)`) on each of [`FTS_INDEXES`]. The default
+/// (rank 0) form only checks the index's internal structure; the `rank = 1` form
+/// additionally verifies the index matches its external-content table, so it
+/// catches drift between, e.g., `saved_posts` and `posts_fts` that the plain form
+/// misses. A sound index returns `Ok`; a corrupt or drifted one surfaces SQLite's
+/// `SQLITE_CORRUPT_VTAB`, mapped to a clear error pointing at
+/// [`rebuild_fts_index`] for recovery. Any other database failure propagates with
+/// context rather than being swallowed.
+pub fn fts_integrity_check(conn: &Connection) -> Result<()> {
+    for index in FTS_INDEXES {
+        match conn.execute(
+            &format!("INSERT INTO {index}({index}, rank) VALUES ('integrity-check', 1)"),
+            [],
+        ) {
+            Ok(_) => {}
+            Err(err) if is_fts_corruption(&err) => {
+                return Err(anyhow!(
+                    "full-text search index {index} failed its integrity check (corruption or \
+                     drift detected); rebuild it to recover: {err}"
+                ));
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("failed to run full-text search integrity check on {index}")
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether a rusqlite error is an FTS5 corruption signal (`SQLITE_CORRUPT` and its
+/// `SQLITE_CORRUPT_VTAB` extension both map to the `DatabaseCorrupt` primary code).
+fn is_fts_corruption(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(e, _) if e.code == rusqlite::ErrorCode::DatabaseCorrupt
+    )
+}
+
+/// Prototype scaffolding (RSS-36): merged full-text search across all three
+/// external-content FTS indexes.
+///
+/// UNIONs `posts_fts` ∪ `capture_fts` ∪ `enrichment_fts`, resolving every FTS
+/// `rowid` back to its owning `saved_posts.reddit_fullname`
+/// (`capture_fts.rowid` → `outbound_captures.rowid` → `reddit_fullname`;
+/// `enrichment_fts.rowid` → `enrichment_runs.rowid` → `reddit_fullname`). A post
+/// that matches in several sources — or several enrichment runs (1:many) — is
+/// de-duplicated by `reddit_fullname`, keeping the single best (lowest) BM25
+/// rank and that match's snippet.
+///
+/// This is **unwired prototype scaffolding**: the shipped CLI still calls
+/// [`search_posts`], which is deliberately untouched. BM25 ranks are only
+/// roughly comparable across tables (each index weights its own columns), so
+/// ordering *between* sources is approximate. See
+/// `docs/explanation/fts-multi-source.md` for the design and open tradeoffs.
+pub fn search_multi_source(conn: &Connection, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let fts_query = normalize_fts_query(query)?;
+    let mut stmt = conn
+        .prepare(
+            "WITH matches AS (
+                 SELECT sp.reddit_fullname AS reddit_fullname,
+                        bm25(posts_fts, 10.0, 1.0) AS rank,
+                        snippet(posts_fts, -1, '<mark>', '</mark>', '...', 32) AS snippet
+                 FROM posts_fts
+                 JOIN saved_posts sp ON sp.rowid = posts_fts.rowid
+                 WHERE posts_fts MATCH ?1
+                 UNION ALL
+                 SELECT oc.reddit_fullname AS reddit_fullname,
+                        bm25(capture_fts) AS rank,
+                        snippet(capture_fts, -1, '<mark>', '</mark>', '...', 32) AS snippet
+                 FROM capture_fts
+                 JOIN outbound_captures oc ON oc.rowid = capture_fts.rowid
+                 WHERE capture_fts MATCH ?1
+                 UNION ALL
+                 SELECT er.reddit_fullname AS reddit_fullname,
+                        bm25(enrichment_fts) AS rank,
+                        snippet(enrichment_fts, -1, '<mark>', '</mark>', '...', 32) AS snippet
+                 FROM enrichment_fts
+                 JOIN enrichment_runs er ON er.rowid = enrichment_fts.rowid
+                 WHERE enrichment_fts MATCH ?1
+             ),
+             best AS (
+                 SELECT reddit_fullname, MIN(rank) AS rank
+                 FROM matches
+                 GROUP BY reddit_fullname
+             )
+             SELECT p.reddit_fullname,
+                    p.title,
+                    p.author,
+                    p.subreddit,
+                    p.permalink,
+                    p.outbound_url,
+                    (SELECT m.snippet FROM matches m
+                     WHERE m.reddit_fullname = b.reddit_fullname
+                     ORDER BY m.rank ASC LIMIT 1) AS snippet,
+                    b.rank,
+                    p.last_seen_at
+             FROM best b
+             JOIN saved_posts p ON p.reddit_fullname = b.reddit_fullname
+             ORDER BY b.rank ASC, p.last_seen_at DESC
+             LIMIT ?2",
+        )
+        .context("failed to prepare multi-source search query")?;
+
+    let rows = stmt
+        .query_map(params![fts_query, limit], |row| {
+            Ok(SearchHit {
+                reddit_fullname: row.get(0)?,
+                title: row.get(1)?,
+                author: row.get(2)?,
+                subreddit: row.get(3)?,
+                permalink: row.get(4)?,
+                outbound_url: row.get(5)?,
+                snippet: row.get(6)?,
+                rank: row.get(7)?,
+                last_seen_at: row.get(8)?,
+            })
+        })
+        // The query syntax was already validated in normalize_fts_query, so an
+        // error here is a database failure, not bad user input.
+        .context("failed to execute multi-source search query")?;
+
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to collect multi-source search results")
+}
+
 fn normalize_fts_query(query: &str) -> Result<String> {
     let mut parts = Vec::new();
     let mut current = String::new();
@@ -142,8 +304,11 @@ fn push_quoted_search_part(parts: &mut Vec<String>, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::test_support::{test_db, test_post};
-    use crate::db::upsert_post;
+    use crate::db::test_support::{test_db, test_output, test_post};
+    use crate::db::{
+        OutboundCaptureUpsert, record_enrichment_success, upsert_outbound_capture, upsert_post,
+    };
+    use crate::models::RecommendedAction;
 
     #[test]
     fn fts_triggers_keep_index_in_sync() {
@@ -267,5 +432,303 @@ mod tests {
         let err = search_posts(&conn, "\"unterminated", &SearchFilters::default(), 10)
             .expect_err("malformed query should fail");
         assert!(err.to_string().contains("invalid search query"));
+    }
+
+    /// Battery of stable search terms exercised before and after a rebuild. Every
+    /// term is present in the deterministic fixtures below regardless of the
+    /// random token suffix, so the result set is comparable across rebuilds.
+    const REBUILD_QUERIES: &[&str] = &[
+        "seq", "title", "body", "alpha0", "alpha1", "alpha2", "alpha3", "alpha4", "alpha5",
+        "beta0", "beta1", "beta2", "beta3", "beta4", "beta5",
+    ];
+
+    /// Snapshot the trigger-maintained search results across the query battery as
+    /// comparable `(query, [fullname|rank])` rows. Rank is formatted to a fixed
+    /// precision so the trigger-maintained and freshly rebuilt indexes compare by
+    /// value even though `SearchHit` is not `PartialEq`.
+    fn search_snapshot(conn: &Connection) -> Vec<(String, Vec<String>)> {
+        REBUILD_QUERIES
+            .iter()
+            .map(|query| {
+                let hits = search_posts(conn, query, &SearchFilters::default(), 100)
+                    .expect("snapshot search should succeed");
+                let rows = hits
+                    .iter()
+                    .map(|hit| format!("{}|{:.6}", hit.reddit_fullname, hit.rank))
+                    .collect();
+                ((*query).to_string(), rows)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn maintained_index_matches_rebuild_after_random_mutations() {
+        let conn = test_db();
+
+        // Tiny deterministic LCG (no `rand` dependency) so the upsert/delete
+        // sequence is reproducible. Constants are the well-known PCG/MMIX values.
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as u32
+        };
+
+        // Churn a small pool of rows so inserts, updates, and deletes interleave
+        // and the FTS triggers (ai/ad/au) all fire repeatedly.
+        const POOL: u32 = 6;
+        for _ in 0..200 {
+            let idx = next() % POOL;
+            let fullname = format!("t3_seq_{idx}");
+            if next() % 3 == 2 {
+                conn.execute(
+                    "DELETE FROM saved_posts WHERE reddit_fullname = ?",
+                    params![fullname],
+                )
+                .expect("delete should succeed");
+            } else {
+                let token = next() % 1000;
+                let mut post = test_post();
+                post.reddit_fullname = fullname;
+                post.reddit_id = format!("seq{idx}");
+                post.title = format!("seq title alpha{idx} term{token}");
+                post.content_markdown = Some(format!("seq body beta{idx} word{token}"));
+                upsert_post(&conn, &post).expect("upsert should succeed");
+            }
+        }
+
+        // The trigger-maintained index must already be internally consistent.
+        fts_integrity_check(&conn).expect("maintained index should pass integrity check");
+
+        // An unconditional rebuild reconstructs the index from `saved_posts`
+        // alone; if the triggers kept it faithful, the result set is identical.
+        let before = search_snapshot(&conn);
+        rebuild_fts_index(&conn).expect("rebuild should succeed");
+        let after = search_snapshot(&conn);
+
+        assert_eq!(
+            before, after,
+            "trigger-maintained index must match a freshly rebuilt one"
+        );
+        fts_integrity_check(&conn).expect("rebuilt index should pass integrity check");
+    }
+
+    #[test]
+    fn rebuild_restores_drifted_index() {
+        let conn = test_db();
+        let mut post = test_post();
+        post.reddit_fullname = "t3_drift".to_string();
+        post.reddit_id = "drift".to_string();
+        post.title = "Zebra drift title".to_string();
+        post.content_markdown = Some("zebra drift body".to_string());
+        upsert_post(&conn, &post).expect("post should insert");
+
+        let baseline = search_posts(&conn, "zebra", &SearchFilters::default(), 10)
+            .expect("baseline search should succeed");
+        assert_eq!(baseline.len(), 1, "precondition: post is indexed");
+
+        // Deliberately desync the index: remove the post's FTS entry via the FTS5
+        // special 'delete' syntax while leaving the `saved_posts` row in place, so
+        // the index drifts (a document missing relative to the content table).
+        // This depends on the FTS rowid mirroring `saved_posts.rowid`.
+        conn.execute(
+            "INSERT INTO posts_fts(posts_fts, rowid, title, content_markdown)
+             SELECT 'delete', rowid, title, content_markdown
+             FROM saved_posts WHERE reddit_fullname = 't3_drift'",
+            [],
+        )
+        .expect("desync should succeed");
+
+        let drifted = search_posts(&conn, "zebra", &SearchFilters::default(), 10)
+            .expect("drifted search should succeed");
+        assert!(
+            drifted.is_empty(),
+            "drift is observable: maintained index no longer matches the table"
+        );
+
+        // The rank=1 integrity-check must catch the drift (the plain rank=0 form
+        // does not, which is why fts_integrity_check uses 'integrity-check', 1).
+        let err =
+            fts_integrity_check(&conn).expect_err("integrity check should fail on a drifted index");
+        assert!(err.to_string().contains("integrity check"), "got: {err}");
+
+        // The unconditional rebuild restores maintained == rebuilt.
+        rebuild_fts_index(&conn).expect("rebuild should succeed");
+        let restored = search_posts(&conn, "zebra", &SearchFilters::default(), 10)
+            .expect("restored search should succeed");
+        assert_eq!(restored.len(), 1, "rebuild repairs the drifted index");
+        assert_eq!(restored[0].reddit_fullname, "t3_drift");
+
+        fts_integrity_check(&conn).expect("integrity check should pass after rebuild");
+    }
+
+    #[test]
+    fn is_fts_corruption_classifies_only_corruption_errors() {
+        // The corruption-mapping arm of fts_integrity_check is the function's
+        // reason to exist; driving real index corruption is SQLite-version
+        // dependent, so verify the classifier directly and deterministically.
+        // SQLITE_CORRUPT_VTAB is the extended code FTS5 raises; rusqlite reports
+        // its primary code as DatabaseCorrupt.
+        let corrupt = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT_VTAB),
+            Some("fts5: corruption detected".to_string()),
+        );
+        assert!(
+            is_fts_corruption(&corrupt),
+            "SQLITE_CORRUPT_VTAB is corruption"
+        );
+
+        let busy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            None,
+        );
+        assert!(!is_fts_corruption(&busy), "SQLITE_BUSY is not corruption");
+
+        assert!(
+            !is_fts_corruption(&rusqlite::Error::QueryReturnedNoRows),
+            "non-SqliteFailure errors are not corruption"
+        );
+    }
+
+    #[test]
+    fn fts_integrity_check_covers_aux_indexes() {
+        // Maintenance must catch drift in the aux FTS tables, not just posts_fts —
+        // otherwise `fts check` reports OK while capture/enrichment search is stale.
+        let conn = test_db();
+        let mut post = test_post();
+        post.reddit_fullname = "t3_aux".to_string();
+        post.reddit_id = "aux".to_string();
+        upsert_post(&conn, &post).expect("post should insert");
+        upsert_outbound_capture(&conn, &capture_with("t3_aux", "tungsten capture body"))
+            .expect("capture should insert");
+
+        fts_integrity_check(&conn).expect("freshly maintained aux indexes pass");
+
+        // Desync capture_fts only (its rowid mirrors outbound_captures.rowid),
+        // leaving posts_fts intact, so the failure must come from the aux index.
+        conn.execute(
+            "INSERT INTO capture_fts(capture_fts, rowid, title, description, site_name, content_markdown)
+             SELECT 'delete', rowid, title, description, site_name, content_markdown
+             FROM outbound_captures WHERE reddit_fullname = 't3_aux'",
+            [],
+        )
+        .expect("capture_fts desync should succeed");
+
+        let err =
+            fts_integrity_check(&conn).expect_err("integrity check must catch drifted aux index");
+        assert!(err.to_string().contains("capture_fts"), "got: {err}");
+
+        rebuild_fts_index(&conn).expect("rebuild should succeed");
+        fts_integrity_check(&conn).expect("rebuild repairs the aux index");
+    }
+
+    /// Build a successful capture upsert whose searchable text lives in
+    /// `description`, so a term unique to the capture exercises `capture_fts`.
+    fn capture_with(reddit_fullname: &str, description: &str) -> OutboundCaptureUpsert {
+        OutboundCaptureUpsert {
+            reddit_fullname: reddit_fullname.to_string(),
+            original_url: "https://example.com/article".to_string(),
+            final_url: None,
+            canonical_url: None,
+            title: Some("Captured heading".to_string()),
+            description: Some(description.to_string()),
+            site_name: Some("example.com".to_string()),
+            preview_image_url: None,
+            content_markdown: None,
+            content_hash: None,
+            status: "success".to_string(),
+            http_status: Some(200),
+            error: None,
+        }
+    }
+
+    /// Prototype scaffolding (RSS-36): the merged multi-source search must resolve
+    /// matches from each external-content aux FTS table back to the owning post
+    /// and de-duplicate by `reddit_fullname`, keeping a single best-ranked hit.
+    #[test]
+    fn search_multi_source_resolves_and_dedupes_across_sources() {
+        let conn = test_db();
+
+        // Post A: a term unique to the post body (posts_fts path) plus a term
+        // shared with its capture (cross-source dedup path).
+        let mut post_a = test_post();
+        post_a.reddit_fullname = "t3_postonly".to_string();
+        post_a.reddit_id = "postonly".to_string();
+        post_a.title = "Plain heading".to_string();
+        post_a.content_markdown = Some("xenon body argon overlap".to_string());
+        upsert_post(&conn, &post_a).expect("post a should insert");
+        upsert_outbound_capture(&conn, &capture_with("t3_postonly", "argon mirrored"))
+            .expect("capture a should insert");
+
+        // Post B: the term lives only in the outbound capture (capture_fts path).
+        let mut post_b = test_post();
+        post_b.reddit_fullname = "t3_captureonly".to_string();
+        post_b.reddit_id = "captureonly".to_string();
+        post_b.title = "Unrelated heading".to_string();
+        post_b.content_markdown = Some("nothing notable".to_string());
+        upsert_post(&conn, &post_b).expect("post b should insert");
+        upsert_outbound_capture(&conn, &capture_with("t3_captureonly", "krypton deep dive"))
+            .expect("capture b should insert");
+
+        // Post C: the term lives only in enrichment output (enrichment_fts path),
+        // recorded twice to exercise the 1:many dedup-by-fullname.
+        let mut post_c = test_post();
+        post_c.reddit_fullname = "t3_enrichonly".to_string();
+        post_c.reddit_id = "enrichonly".to_string();
+        post_c.title = "Another heading".to_string();
+        post_c.content_markdown = Some("plain text".to_string());
+        upsert_post(&conn, &post_c).expect("post c should insert");
+        for summary in ["radon first run", "radon second run"] {
+            record_enrichment_success(
+                &conn,
+                "t3_enrichonly",
+                "provider",
+                "model",
+                "prompt",
+                "raw",
+                &test_output(RecommendedAction::ReadingQueue, summary),
+            )
+            .expect("enrichment should insert");
+        }
+
+        // Each source resolves to exactly its owning post.
+        let post_hits =
+            search_multi_source(&conn, "xenon", 10).expect("post search should succeed");
+        assert_eq!(post_hits.len(), 1);
+        assert_eq!(post_hits[0].reddit_fullname, "t3_postonly");
+
+        let capture_hits =
+            search_multi_source(&conn, "krypton", 10).expect("capture search should succeed");
+        assert_eq!(capture_hits.len(), 1);
+        assert_eq!(capture_hits[0].reddit_fullname, "t3_captureonly");
+
+        let enrich_hits =
+            search_multi_source(&conn, "radon", 10).expect("enrichment search should succeed");
+        assert_eq!(
+            enrich_hits.len(),
+            1,
+            "1:many enrichment dedupes by fullname"
+        );
+        assert_eq!(enrich_hits[0].reddit_fullname, "t3_enrichonly");
+
+        // A term present in both a post and its capture yields a single hit.
+        let shared_hits =
+            search_multi_source(&conn, "argon", 10).expect("shared search should succeed");
+        assert_eq!(
+            shared_hits.len(),
+            1,
+            "matches dedupe across sources by fullname"
+        );
+        assert_eq!(shared_hits[0].reddit_fullname, "t3_postonly");
+    }
+
+    #[test]
+    fn search_multi_source_respects_zero_limit() {
+        let conn = test_db();
+        let post = test_post();
+        upsert_post(&conn, &post).expect("post should insert");
+        let hits = search_multi_source(&conn, "markdown", 0).expect("zero limit should succeed");
+        assert!(hits.is_empty());
     }
 }
