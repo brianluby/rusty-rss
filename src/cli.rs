@@ -184,7 +184,8 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Maintain the full-text search index (rebuild / integrity check)
+    /// Maintain all full-text search indexes: posts, captures, enrichment
+    /// (rebuild / integrity check)
     #[command(hide = true)]
     Fts {
         #[command(subcommand)]

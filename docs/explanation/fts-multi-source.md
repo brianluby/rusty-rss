@@ -38,7 +38,8 @@ open.
 
 ## Merge semantics
 
-`search::search_multi_source(conn, query, limit)` UNIONs the three indexes and
+`search::search_multi_source(conn, query, limit)` uses `UNION ALL` across the
+three indexes (de-duplicating later by `reddit_fullname`, not in SQL) and
 resolves every FTS `rowid` back to the owning post:
 
 - `posts_fts.rowid` → `saved_posts.rowid` → `reddit_fullname`

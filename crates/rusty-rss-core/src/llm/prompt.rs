@@ -103,10 +103,21 @@ pub(crate) fn build_enrichment_messages(
     ]
 }
 
+/// Maximum number of characters of the rejected response echoed back in a repair
+/// prompt. A malformed response can be arbitrarily long; echoing it verbatim
+/// could blow the context headroom and turn a recoverable parse miss into a
+/// deterministic second-request failure, so it is bounded independently of the
+/// post-content budget.
+pub(crate) const MAX_REPAIR_RESPONSE_CHARS: usize = 4_000;
+
 /// Build the repair prompt: the original enrichment messages followed by a
-/// correction instruction that points back at the rubric already in scope.
+/// correction instruction that points back at the rubric already in scope. The
+/// rejected response is truncated to [`MAX_REPAIR_RESPONSE_CHARS`] so a long
+/// malformed payload cannot overflow the retry request.
 pub(crate) fn build_repair_messages(post: &SavedPost, invalid_response: &str) -> Vec<ChatMessage> {
     let mut messages = build_enrichment_messages(post, MAX_CONTENT_CHARS);
+    let (invalid_response, _truncated) =
+        truncate_for_budget(invalid_response, MAX_REPAIR_RESPONSE_CHARS);
     messages.push(ChatMessage {
         role: "user",
         content: format!(
@@ -310,6 +321,31 @@ mod tests {
         assert!(truncated);
         assert!(out.chars().count() <= 50);
         assert!(out.ends_with(TRUNCATION_MARKER));
+    }
+
+    #[test]
+    fn repair_prompt_bounds_the_echoed_invalid_response() {
+        // A long malformed payload must not be echoed verbatim into the retry, or
+        // it could overflow the request and make the repair attempt fail too.
+        let huge = "garbage ".repeat(5_000);
+        let messages = build_repair_messages(&normal_post(), &huge);
+
+        let repair = &messages.last().expect("repair message present").content;
+        assert!(
+            repair.contains(TRUNCATION_MARKER),
+            "long response is truncated"
+        );
+        // The echoed response is bounded; the marker keeps it within budget.
+        assert!(
+            repair.chars().count() < huge.chars().count(),
+            "repair message must be shorter than the raw invalid response"
+        );
+
+        // A short invalid response is echoed unchanged (no spurious truncation).
+        let short = build_repair_messages(&normal_post(), "{\"bad\": true}");
+        let short_repair = &short.last().expect("repair message present").content;
+        assert!(short_repair.contains("{\"bad\": true}"));
+        assert!(!short_repair.contains(TRUNCATION_MARKER));
     }
 
     #[test]

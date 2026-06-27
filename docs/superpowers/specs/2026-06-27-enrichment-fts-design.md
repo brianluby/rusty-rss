@@ -122,8 +122,8 @@ with:
   it, and the meaning + `[0.0,1.0]` range of `joy_value` (personal interest),
   `work_value` (build/learn utility), `confidence` (model certainty). The rubric
   also serves as repair guidance.
-- `build_enrichment_messages(post, budget) -> Vec<Message>` — deterministic;
-  same shape the OpenAI provider already sends.
+- `build_enrichment_messages(post, max_content_chars) -> Vec<ChatMessage>` —
+  deterministic; same shape the OpenAI provider already sends.
 - `truncate_for_budget(markdown, max_chars) -> (String, bool)` — char-based (no
   tokenizer dep); keeps the head and appends a truncation marker when cut.
   Default budget a named const (e.g. `MAX_CONTENT_CHARS = 12_000`).

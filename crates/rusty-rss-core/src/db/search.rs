@@ -86,40 +86,66 @@ pub fn search_posts(
         .context("failed to collect search results")
 }
 
-/// Unconditionally rebuild the `posts_fts` index from `saved_posts`.
+/// Every external-content FTS5 index in the schema, each keyed to its content
+/// table by `rowid`: `posts_fts` over `saved_posts`, `capture_fts` over
+/// `outbound_captures`, and `enrichment_fts` over `enrichment_runs`. The
+/// maintenance helpers below operate on all of them so a `rebuild`/`check` keeps
+/// the whole search subsystem (incl. the multi-source aux indexes) consistent,
+/// not just post search. Names are compile-time constants — never user input —
+/// so interpolating them into the FTS command statements is safe.
+const FTS_INDEXES: [&str; 3] = ["posts_fts", "capture_fts", "enrichment_fts"];
+
+/// Unconditionally rebuild every FTS index from its content table.
 ///
-/// `posts_fts` is an external-content FTS5 table over
-/// `saved_posts(title, content_markdown)` with `content_rowid='rowid'`, so every
-/// indexed document is keyed by its `saved_posts.rowid`. The `'rebuild'` command
-/// discards the index and reconstructs it from that content table, repairing any
-/// drift left by missed triggers or manual edits. Unlike `rebuild_stale_fts_index`
-/// (which runs only inside `init_db` and skips when counts already match), this is
-/// the maintenance entry point and always rebuilds.
+/// Each index is external-content (`content=...`, `content_rowid='rowid'`), so
+/// the `'rebuild'` command discards the index and reconstructs it from the
+/// content table, repairing any drift left by missed triggers or manual edits.
+/// Unlike `rebuild_stale_fts_index` (which runs only inside `init_db` and skips
+/// when counts already match), this is the maintenance entry point and always
+/// rebuilds all of [`FTS_INDEXES`].
 pub fn rebuild_fts_index(conn: &Connection) -> Result<()> {
-    conn.execute("INSERT INTO posts_fts(posts_fts) VALUES ('rebuild')", [])
-        .context("failed to rebuild full-text search index")?;
+    for index in FTS_INDEXES {
+        conn.execute(
+            &format!("INSERT INTO {index}({index}) VALUES ('rebuild')"),
+            [],
+        )
+        .with_context(|| format!("failed to rebuild full-text search index {index}"))?;
+    }
     Ok(())
 }
 
-/// Verify the `posts_fts` index is internally consistent and matches its
-/// `saved_posts` content table.
+/// Verify every FTS index is internally consistent and matches its content table.
 ///
-/// Runs the FTS5 `'integrity-check'` command. A structurally sound index returns
-/// `Ok`; a corrupt or drifted one surfaces SQLite's `SQLITE_CORRUPT_VTAB`, which
-/// is mapped to a clear error pointing at [`rebuild_fts_index`] for recovery. Any
-/// other database failure is propagated with context rather than swallowed.
+/// Runs the FTS5 `'integrity-check'` command in its `rank = 1` form
+/// (`VALUES ('integrity-check', 1)`) on each of [`FTS_INDEXES`]. The default
+/// (rank 0) form only checks the index's internal structure; the `rank = 1` form
+/// additionally verifies the index matches its external-content table, so it
+/// catches drift between, e.g., `saved_posts` and `posts_fts` that the plain form
+/// misses. A sound index returns `Ok`; a corrupt or drifted one surfaces SQLite's
+/// `SQLITE_CORRUPT_VTAB`, mapped to a clear error pointing at
+/// [`rebuild_fts_index`] for recovery. Any other database failure propagates with
+/// context rather than being swallowed.
 pub fn fts_integrity_check(conn: &Connection) -> Result<()> {
-    match conn.execute(
-        "INSERT INTO posts_fts(posts_fts) VALUES ('integrity-check')",
-        [],
-    ) {
-        Ok(_) => Ok(()),
-        Err(err) if is_fts_corruption(&err) => Err(anyhow!(
-            "full-text search index failed its integrity check (corruption or drift \
-             detected); rebuild it to recover: {err}"
-        )),
-        Err(err) => Err(err).context("failed to run full-text search integrity check"),
+    for index in FTS_INDEXES {
+        match conn.execute(
+            &format!("INSERT INTO {index}({index}, rank) VALUES ('integrity-check', 1)"),
+            [],
+        ) {
+            Ok(_) => {}
+            Err(err) if is_fts_corruption(&err) => {
+                return Err(anyhow!(
+                    "full-text search index {index} failed its integrity check (corruption or \
+                     drift detected); rebuild it to recover: {err}"
+                ));
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("failed to run full-text search integrity check on {index}")
+                });
+            }
+        }
     }
+    Ok(())
 }
 
 /// Whether a rusqlite error is an FTS5 corruption signal (`SQLITE_CORRUPT` and its
@@ -521,6 +547,12 @@ mod tests {
             "drift is observable: maintained index no longer matches the table"
         );
 
+        // The rank=1 integrity-check must catch the drift (the plain rank=0 form
+        // does not, which is why fts_integrity_check uses 'integrity-check', 1).
+        let err =
+            fts_integrity_check(&conn).expect_err("integrity check should fail on a drifted index");
+        assert!(err.to_string().contains("integrity check"), "got: {err}");
+
         // The unconditional rebuild restores maintained == rebuilt.
         rebuild_fts_index(&conn).expect("rebuild should succeed");
         let restored = search_posts(&conn, "zebra", &SearchFilters::default(), 10)
@@ -557,6 +589,38 @@ mod tests {
             !is_fts_corruption(&rusqlite::Error::QueryReturnedNoRows),
             "non-SqliteFailure errors are not corruption"
         );
+    }
+
+    #[test]
+    fn fts_integrity_check_covers_aux_indexes() {
+        // Maintenance must catch drift in the aux FTS tables, not just posts_fts —
+        // otherwise `fts check` reports OK while capture/enrichment search is stale.
+        let conn = test_db();
+        let mut post = test_post();
+        post.reddit_fullname = "t3_aux".to_string();
+        post.reddit_id = "aux".to_string();
+        upsert_post(&conn, &post).expect("post should insert");
+        upsert_outbound_capture(&conn, &capture_with("t3_aux", "tungsten capture body"))
+            .expect("capture should insert");
+
+        fts_integrity_check(&conn).expect("freshly maintained aux indexes pass");
+
+        // Desync capture_fts only (its rowid mirrors outbound_captures.rowid),
+        // leaving posts_fts intact, so the failure must come from the aux index.
+        conn.execute(
+            "INSERT INTO capture_fts(capture_fts, rowid, title, description, site_name, content_markdown)
+             SELECT 'delete', rowid, title, description, site_name, content_markdown
+             FROM outbound_captures WHERE reddit_fullname = 't3_aux'",
+            [],
+        )
+        .expect("capture_fts desync should succeed");
+
+        let err =
+            fts_integrity_check(&conn).expect_err("integrity check must catch drifted aux index");
+        assert!(err.to_string().contains("capture_fts"), "got: {err}");
+
+        rebuild_fts_index(&conn).expect("rebuild should succeed");
+        fts_integrity_check(&conn).expect("rebuild repairs the aux index");
     }
 
     /// Build a successful capture upsert whose searchable text lives in

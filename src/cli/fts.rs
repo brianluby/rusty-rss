@@ -1,20 +1,22 @@
 //! Hidden full-text-search maintenance command: integrity check and reindex.
 //!
-//! These are recovery tools for a drifted or corrupt `posts_fts` index, not part
-//! of the everyday workflow, so the parent `fts` command is `#[command(hide)]`.
-//! This is the repo's first nested clap [`Subcommand`].
+//! These are recovery tools for a drifted or corrupt FTS index — `posts_fts` and
+//! the aux `capture_fts` / `enrichment_fts` indexes — not part of the everyday
+//! workflow, so the parent `fts` command is `#[command(hide)]`. This is the
+//! repo's first nested clap [`Subcommand`].
 
 use anyhow::Result;
 use clap::Subcommand;
 use rusty_rss_core::db;
 use std::path::PathBuf;
 
-/// Maintenance operations for the full-text search index.
+/// Maintenance operations covering all full-text search indexes (`posts_fts`,
+/// `capture_fts`, `enrichment_fts`).
 #[derive(Subcommand)]
 pub enum FtsCommand {
-    /// Rebuild the full-text search index from `saved_posts`
+    /// Rebuild every full-text search index from its content table
     Rebuild,
-    /// Verify the full-text search index is consistent with its content table
+    /// Verify every full-text search index is consistent with its content table
     Check,
 }
 
@@ -24,13 +26,13 @@ pub(super) fn run_fts(db_path: PathBuf, command: FtsCommand) -> Result<()> {
     match command {
         FtsCommand::Rebuild => {
             db::rebuild_fts_index(&conn)?;
-            println!("Full-text search index rebuilt.");
+            println!("Full-text search indexes rebuilt.");
         }
         FtsCommand::Check => {
             // A failed integrity check returns an error here, which propagates to
             // a non-zero process exit via `main`.
             db::fts_integrity_check(&conn)?;
-            println!("Full-text search index OK.");
+            println!("Full-text search indexes OK.");
         }
     }
 
