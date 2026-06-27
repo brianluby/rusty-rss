@@ -1,0 +1,11 @@
+[package]
+name = "rusty-rss-mcp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+[dependencies]
+anyhow = "1"
+rusty-rss-core = { path = "../rusty-rss-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
