@@ -6,6 +6,8 @@ rust-version = "1.85"
 
 [workspace]
 members = [".", "crates/rusty-rss-core"]
+# rusty-rss-mcp is still in progress and excluded from this branch.
+exclude = ["crates/rusty-rss-mcp"]
 
 [dependencies]
 anyhow = "1"

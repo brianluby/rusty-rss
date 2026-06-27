@@ -1,9 +1,11 @@
 use crate::models::{
-    Classification, EnrichmentOutput, EnrichmentRecord, RecommendedAction, SavedPost, TriageItem,
+    Classification, EnrichmentOutput, EnrichmentRecord, ExportRecord, OutboundCapture, PostTag,
+    RecommendedAction, SavedPost, TriageItem,
 };
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, params};
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 pub fn init_db(db_path: &Path) -> Result<Connection> {
@@ -76,14 +78,113 @@ pub fn init_db(db_path: &Path) -> Result<Connection> {
             ON enrichment_runs(status);
         CREATE INDEX IF NOT EXISTS idx_enrichment_runs_action
             ON enrichment_runs(recommended_action);
+
+        CREATE TABLE IF NOT EXISTS outbound_captures (
+            reddit_fullname TEXT PRIMARY KEY,
+            original_url TEXT NOT NULL,
+            final_url TEXT,
+            canonical_url TEXT,
+            title TEXT,
+            description TEXT,
+            site_name TEXT,
+            preview_image_url TEXT,
+            content_markdown TEXT,
+            content_hash TEXT,
+            status TEXT NOT NULL,
+            http_status INTEGER,
+            error TEXT,
+            fetched_at TEXT NOT NULL,
+            attempt_count INTEGER NOT NULL DEFAULT 1,
+            FOREIGN KEY (reddit_fullname) REFERENCES saved_posts(reddit_fullname)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_outbound_captures_status
+            ON outbound_captures(status);
+        CREATE INDEX IF NOT EXISTS idx_outbound_captures_fetched_at
+            ON outbound_captures(fetched_at);
+
+        CREATE TABLE IF NOT EXISTS post_tags (
+            reddit_fullname TEXT NOT NULL REFERENCES saved_posts(reddit_fullname),
+            topic TEXT NOT NULL,
+            score REAL NOT NULL,
+            threshold REAL NOT NULL,
+            passed INTEGER NOT NULL,
+            matched_rules TEXT NOT NULL,
+            signals TEXT,
+            ruleset_version TEXT NOT NULL,
+            tagged_at TEXT NOT NULL,
+            PRIMARY KEY (reddit_fullname, topic)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_post_tags_topic ON post_tags(topic, passed);
+        CREATE INDEX IF NOT EXISTS idx_post_tags_score ON post_tags(topic, score DESC);
         "#,
     )
     .context("failed to initialize database schema")?;
 
     ensure_column(&conn, "saved_posts", "content_markdown", "TEXT")?;
+    ensure_column(&conn, "outbound_captures", "content_markdown", "TEXT")?;
+    ensure_column(&conn, "outbound_captures", "content_hash", "TEXT")?;
     migrate_content_html_to_markdown(&conn)?;
+    init_fts(&conn)?;
+    rebuild_empty_fts_index(&conn)?;
 
     Ok(conn)
+}
+
+fn init_fts(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE VIRTUAL TABLE IF NOT EXISTS posts_fts USING fts5(
+            title,
+            content_markdown,
+            content='saved_posts',
+            content_rowid='rowid',
+            tokenize='porter unicode61'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS saved_posts_ai AFTER INSERT ON saved_posts BEGIN
+            INSERT INTO posts_fts(rowid, title, content_markdown)
+            VALUES (new.rowid, new.title, new.content_markdown);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS saved_posts_ad AFTER DELETE ON saved_posts BEGIN
+            INSERT INTO posts_fts(posts_fts, rowid, title, content_markdown)
+            VALUES ('delete', old.rowid, old.title, old.content_markdown);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS saved_posts_au AFTER UPDATE ON saved_posts BEGIN
+            INSERT INTO posts_fts(posts_fts, rowid, title, content_markdown)
+            VALUES ('delete', old.rowid, old.title, old.content_markdown);
+            INSERT INTO posts_fts(rowid, title, content_markdown)
+            VALUES (new.rowid, new.title, new.content_markdown);
+        END;
+        "#,
+    )
+    .context("failed to initialize full-text search schema")?;
+
+    Ok(())
+}
+
+fn rebuild_empty_fts_index(conn: &Connection) -> Result<()> {
+    let saved_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM saved_posts", [], |row| row.get(0))
+        .context("failed to count saved posts for FTS rebuild")?;
+    if saved_count == 0 {
+        return Ok(());
+    }
+
+    let indexed_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM posts_fts_docsize", [], |row| {
+            row.get(0)
+        })
+        .context("failed to count indexed FTS documents")?;
+    if indexed_count == 0 {
+        conn.execute("INSERT INTO posts_fts(posts_fts) VALUES ('rebuild')", [])
+            .context("failed to rebuild full-text search index")?;
+    }
+
+    Ok(())
 }
 
 fn ensure_column(conn: &Connection, table: &str, column: &str, column_type: &str) -> Result<()> {
@@ -300,7 +401,7 @@ pub fn list_posts(conn: &Connection, limit: usize, offset: usize) -> Result<Vec<
         .context("failed to collect posts")
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub struct SavedPostRow {
     pub fullname: String,
     pub title: String,
@@ -309,6 +410,140 @@ pub struct SavedPostRow {
     pub permalink: String,
     pub published_at: Option<String>,
     pub last_seen_at: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SearchFilters {
+    pub subreddit: Option<String>,
+    pub author: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SearchHit {
+    pub reddit_fullname: String,
+    pub title: String,
+    pub author: Option<String>,
+    pub subreddit: Option<String>,
+    pub permalink: String,
+    pub outbound_url: Option<String>,
+    pub snippet: String,
+    pub rank: f64,
+    pub last_seen_at: String,
+}
+
+pub fn search_posts(
+    conn: &Connection,
+    query: &str,
+    filters: &SearchFilters,
+    limit: usize,
+) -> Result<Vec<SearchHit>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let fts_query = normalize_fts_query(query)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT p.reddit_fullname,
+                    p.title,
+                    p.author,
+                    p.subreddit,
+                    p.permalink,
+                    p.outbound_url,
+                    snippet(posts_fts, -1, '<mark>', '</mark>', '...', 32) AS snippet,
+                    bm25(posts_fts, 10.0, 1.0) AS rank,
+                    p.last_seen_at
+             FROM posts_fts
+             JOIN saved_posts p ON p.rowid = posts_fts.rowid
+             WHERE posts_fts MATCH ?
+               AND (? IS NULL OR p.subreddit = ?)
+               AND (? IS NULL OR p.author = ?)
+             ORDER BY rank ASC, p.last_seen_at DESC
+             LIMIT ?",
+        )
+        .context("failed to prepare search query")?;
+
+    let rows = stmt
+        .query_map(
+            params![
+                fts_query,
+                filters.subreddit.as_deref(),
+                filters.subreddit.as_deref(),
+                filters.author.as_deref(),
+                filters.author.as_deref(),
+                limit,
+            ],
+            |row| {
+                Ok(SearchHit {
+                    reddit_fullname: row.get(0)?,
+                    title: row.get(1)?,
+                    author: row.get(2)?,
+                    subreddit: row.get(3)?,
+                    permalink: row.get(4)?,
+                    outbound_url: row.get(5)?,
+                    snippet: row.get(6)?,
+                    rank: row.get(7)?,
+                    last_seen_at: row.get(8)?,
+                })
+            },
+        )
+        .map_err(|err| anyhow!("invalid search query: {err}"))?;
+
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to collect search results")
+}
+
+fn normalize_fts_query(query: &str) -> Result<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut in_quote = false;
+
+    for ch in query.chars() {
+        if ch == '"' {
+            if in_quote {
+                push_quoted_search_part(&mut parts, &current);
+                current.clear();
+                in_quote = false;
+            } else {
+                push_unquoted_search_parts(&mut parts, &current);
+                current.clear();
+                in_quote = true;
+            }
+        } else if in_quote || !ch.is_whitespace() {
+            current.push(ch);
+        } else {
+            push_unquoted_search_parts(&mut parts, &current);
+            current.clear();
+        }
+    }
+
+    if in_quote {
+        return Err(anyhow!("invalid search query: unterminated quoted phrase"));
+    }
+    push_unquoted_search_parts(&mut parts, &current);
+
+    if parts.is_empty() {
+        return Err(anyhow!(
+            "invalid search query: query must contain searchable text"
+        ));
+    }
+
+    Ok(parts.join(" AND "))
+}
+
+fn push_unquoted_search_parts(parts: &mut Vec<String>, value: &str) {
+    for term in value.split_whitespace() {
+        push_quoted_search_part(parts, term);
+    }
+}
+
+fn push_quoted_search_part(parts: &mut Vec<String>, value: &str) {
+    let value = value.trim();
+    if !value.chars().any(|ch| ch.is_alphanumeric()) {
+        return;
+    }
+
+    parts.push(format!("\"{}\"", value.replace('"', "\"\"")));
 }
 
 pub fn get_post(conn: &Connection, fullname: &str) -> Result<Option<SavedPost>> {
@@ -357,6 +592,191 @@ pub fn count_posts(conn: &Connection) -> Result<usize> {
         row.get::<_, usize>(0)
     })
     .context("failed to count posts")
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ExportFilters {
+    pub classification: Option<Classification>,
+    pub recommended_action: Option<RecommendedAction>,
+    pub min_joy_value: Option<f32>,
+    pub min_work_value: Option<f32>,
+}
+
+pub fn list_export_records(
+    conn: &Connection,
+    filters: &ExportFilters,
+    limit: usize,
+    offset: usize,
+) -> Result<Vec<ExportRecord>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let classification = filters.classification.map(|value| value.as_str());
+    let action = filters.recommended_action.map(|value| value.as_str());
+    let mut stmt = conn.prepare(
+        "SELECT p.reddit_fullname, p.reddit_id, p.title, p.author, p.subreddit,
+                p.permalink, p.outbound_url, p.content_markdown, p.thumbnail_url,
+                p.published_at, p.updated_at, p.first_seen_at, p.last_seen_at, p.source,
+                e.id, e.reddit_fullname, e.provider, e.model, e.prompt_version, e.status,
+                e.raw_response, e.classification, e.tags_json, e.summary, e.joy_value,
+                e.work_value, e.recommended_action, e.rationale, e.confidence, e.error,
+                e.created_at,
+                c.reddit_fullname, c.original_url, c.final_url, c.canonical_url, c.title,
+                c.description, c.site_name, c.preview_image_url, c.content_markdown,
+                c.content_hash, c.status, c.http_status, c.error, c.fetched_at,
+                c.attempt_count
+         FROM saved_posts p
+         LEFT JOIN enrichment_runs e ON e.id = (
+             SELECT id FROM enrichment_runs latest
+             WHERE latest.reddit_fullname = p.reddit_fullname
+             ORDER BY latest.id DESC
+             LIMIT 1
+         )
+         LEFT JOIN outbound_captures c ON c.reddit_fullname = p.reddit_fullname
+         WHERE (? IS NULL OR e.classification = ?)
+           AND (? IS NULL OR e.recommended_action = ?)
+           AND (? IS NULL OR e.joy_value >= ?)
+           AND (? IS NULL OR e.work_value >= ?)
+         ORDER BY p.last_seen_at DESC
+         LIMIT ? OFFSET ?",
+    )?;
+
+    let rows = stmt
+        .query_map(
+            params![
+                classification,
+                classification,
+                action,
+                action,
+                filters.min_joy_value,
+                filters.min_joy_value,
+                filters.min_work_value,
+                filters.min_work_value,
+                limit,
+                offset,
+            ],
+            export_record_from_row,
+        )
+        .context("failed to query export records")?;
+
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to collect export records")
+}
+
+#[derive(Debug, Clone)]
+pub struct OutboundCaptureCandidate {
+    pub reddit_fullname: String,
+    pub outbound_url: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct OutboundCaptureUpsert {
+    pub reddit_fullname: String,
+    pub original_url: String,
+    pub final_url: Option<String>,
+    pub canonical_url: Option<String>,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub site_name: Option<String>,
+    pub preview_image_url: Option<String>,
+    pub content_markdown: Option<String>,
+    pub content_hash: Option<String>,
+    pub status: String,
+    pub http_status: Option<i64>,
+    pub error: Option<String>,
+}
+
+pub fn list_outbound_capture_candidates(
+    conn: &Connection,
+    limit: usize,
+) -> Result<Vec<OutboundCaptureCandidate>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT p.reddit_fullname, p.outbound_url
+         FROM saved_posts p
+         LEFT JOIN outbound_captures c ON c.reddit_fullname = p.reddit_fullname
+         WHERE p.outbound_url IS NOT NULL
+           AND (c.reddit_fullname IS NULL OR c.status != 'success')
+         ORDER BY p.last_seen_at DESC
+         LIMIT ?",
+    )?;
+
+    let rows = stmt
+        .query_map(params![limit], |row| {
+            Ok(OutboundCaptureCandidate {
+                reddit_fullname: row.get(0)?,
+                outbound_url: row.get(1)?,
+            })
+        })
+        .context("failed to query outbound capture candidates")?;
+
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to collect outbound capture candidates")
+}
+
+pub fn upsert_outbound_capture(conn: &Connection, capture: &OutboundCaptureUpsert) -> Result<()> {
+    conn.execute(
+        r#"INSERT INTO outbound_captures (
+            reddit_fullname, original_url, final_url, canonical_url, title, description,
+            site_name, preview_image_url, content_markdown, content_hash, status,
+            http_status, error, fetched_at, attempt_count
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+        ON CONFLICT(reddit_fullname) DO UPDATE SET
+            original_url = excluded.original_url,
+            final_url = excluded.final_url,
+            canonical_url = excluded.canonical_url,
+            title = excluded.title,
+            description = excluded.description,
+            site_name = excluded.site_name,
+            preview_image_url = excluded.preview_image_url,
+            content_markdown = excluded.content_markdown,
+            content_hash = excluded.content_hash,
+            status = excluded.status,
+            http_status = excluded.http_status,
+            error = excluded.error,
+            fetched_at = excluded.fetched_at,
+            attempt_count = outbound_captures.attempt_count + 1"#,
+        params![
+            capture.reddit_fullname,
+            capture.original_url,
+            capture.final_url,
+            capture.canonical_url,
+            capture.title,
+            capture.description,
+            capture.site_name,
+            capture.preview_image_url,
+            capture.content_markdown,
+            capture.content_hash,
+            capture.status,
+            capture.http_status,
+            capture.error,
+            Utc::now().to_rfc3339(),
+        ],
+    )
+    .context("failed to upsert outbound capture")?;
+
+    Ok(())
+}
+
+pub fn latest_outbound_capture(
+    conn: &Connection,
+    reddit_fullname: &str,
+) -> Result<Option<OutboundCapture>> {
+    conn.query_row(
+        "SELECT reddit_fullname, original_url, final_url, canonical_url, title,
+                description, site_name, preview_image_url, content_markdown,
+                content_hash, status, http_status, error, fetched_at, attempt_count
+         FROM outbound_captures
+         WHERE reddit_fullname = ?",
+        params![reddit_fullname],
+        outbound_capture_from_row,
+    )
+    .optional()
+    .context("failed to query outbound capture")
 }
 
 pub fn list_enrichment_candidates(conn: &Connection, limit: usize) -> Result<Vec<SavedPost>> {
@@ -581,6 +1001,53 @@ fn saved_post_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SavedPost> {
     })
 }
 
+fn export_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ExportRecord> {
+    let latest_enrichment = if row.get::<_, Option<i64>>(14)?.is_some() {
+        Some(enrichment_record_from_row_with_offset(row, 14)?)
+    } else {
+        None
+    };
+    let outbound_capture = if row.get::<_, Option<String>>(31)?.is_some() {
+        Some(outbound_capture_from_row_with_offset(row, 31)?)
+    } else {
+        None
+    };
+
+    Ok(ExportRecord {
+        schema_version: "rusty-rss.export.v1".to_string(),
+        saved_post: saved_post_from_row(row)?,
+        latest_enrichment,
+        outbound_capture,
+    })
+}
+
+fn outbound_capture_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OutboundCapture> {
+    outbound_capture_from_row_with_offset(row, 0)
+}
+
+fn outbound_capture_from_row_with_offset(
+    row: &rusqlite::Row<'_>,
+    offset: usize,
+) -> rusqlite::Result<OutboundCapture> {
+    Ok(OutboundCapture {
+        reddit_fullname: row.get(offset)?,
+        original_url: row.get(offset + 1)?,
+        final_url: row.get(offset + 2)?,
+        canonical_url: row.get(offset + 3)?,
+        title: row.get(offset + 4)?,
+        description: row.get(offset + 5)?,
+        site_name: row.get(offset + 6)?,
+        preview_image_url: row.get(offset + 7)?,
+        content_markdown: row.get(offset + 8)?,
+        content_hash: row.get(offset + 9)?,
+        status: row.get(offset + 10)?,
+        http_status: row.get(offset + 11)?,
+        error: row.get(offset + 12)?,
+        fetched_at: row.get(offset + 13)?,
+        attempt_count: row.get(offset + 14)?,
+    })
+}
+
 fn enrichment_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EnrichmentRecord> {
     let status: String = row.get(5)?;
     let output = if status == "success" {
@@ -679,6 +1146,230 @@ fn enrichment_record_from_row_with_offset(
         output,
         error: row.get(offset + 15)?,
         created_at: row.get(offset + 16)?,
+    })
+}
+
+/// A post in scope for Gate 1 tagging: just the fields the evaluator needs.
+#[derive(Debug, Clone)]
+pub struct TaggablePost {
+    pub rowid: i64,
+    pub reddit_fullname: String,
+    pub subreddit: Option<String>,
+}
+
+/// List posts to tag, newest first. `limit` is an optional debug cap; the
+/// default (`None`) processes the whole archive, because re-tagging everything
+/// on a rule change is the point of the `tag` command.
+pub fn list_taggable_posts(conn: &Connection, limit: Option<usize>) -> Result<Vec<TaggablePost>> {
+    let mut sql = String::from(
+        "SELECT rowid, reddit_fullname, subreddit FROM saved_posts ORDER BY last_seen_at DESC",
+    );
+    if limit.is_some() {
+        sql.push_str(" LIMIT ?");
+    }
+    let mut stmt = conn.prepare(&sql)?;
+    let map_row = |row: &rusqlite::Row<'_>| {
+        Ok(TaggablePost {
+            rowid: row.get(0)?,
+            reddit_fullname: row.get(1)?,
+            subreddit: row.get(2)?,
+        })
+    };
+    let rows = match limit {
+        Some(limit) => stmt.query_map(params![limit], map_row),
+        None => stmt.query_map([], map_row),
+    }
+    .context("failed to query taggable posts")?;
+
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to collect taggable posts")
+}
+
+/// Run one compiled FTS5 operand and return the set of matching `saved_posts`
+/// rowids. Config-malformed expressions surface as a clear error.
+pub fn fts_matching_rowids(conn: &Connection, fts_expr: &str) -> Result<HashSet<i64>> {
+    let mut stmt = conn
+        .prepare_cached("SELECT rowid FROM posts_fts WHERE posts_fts MATCH ?1")
+        .context("failed to prepare FTS match query")?;
+    let ids = stmt
+        .query_map(params![fts_expr], |row| row.get::<_, i64>(0))
+        .map_err(|err| anyhow!("invalid match expression `{fts_expr}`: {err}"))?
+        .collect::<std::result::Result<HashSet<i64>, _>>()
+        .map_err(|err| anyhow!("invalid match expression `{fts_expr}`: {err}"))?;
+    Ok(ids)
+}
+
+/// Smoke-test a compiled FTS5 operand without scanning rows, so a malformed
+/// rule fails the whole run at load time (fail-closed) rather than mid-sweep.
+pub fn validate_fts_expr(conn: &Connection, fts_expr: &str) -> Result<()> {
+    let mut stmt = conn
+        .prepare_cached("SELECT 1 FROM posts_fts WHERE posts_fts MATCH ?1 AND rowid = -1")
+        .context("failed to prepare FTS validation query")?;
+    stmt.query_row(params![fts_expr], |_| Ok(()))
+        .optional()
+        .map_err(|err| anyhow!("invalid match expression `{fts_expr}`: {err}"))?;
+    Ok(())
+}
+
+/// Replace tags for the processed scope authoritatively: within a transaction,
+/// delete the rows the run is responsible for, then insert the freshly computed
+/// rows. Posts that no longer match (or topics removed from the ruleset) lose
+/// their stale tags.
+///
+/// The delete scope is exactly what this run re-evaluated:
+/// - `topic_filter = None` (all topics): the run owns every topic, so an
+///   unprocessed-post row for a now-removed topic must also be cleared.
+/// - `topic_filter = Some(t)`: only topic `t` is touched; other topics' tags
+///   are preserved.
+/// - `full_archive = true`: every post was processed, so the delete is
+///   unscoped by post. Otherwise (a `--limit` debug run) only the processed
+///   posts' rows are deleted, preserving tags for unprocessed posts.
+pub fn replace_post_tags(
+    conn: &Connection,
+    topic_filter: Option<&str>,
+    full_archive: bool,
+    processed_fullnames: &[&str],
+    tags: &[PostTag],
+) -> Result<usize> {
+    let tx = conn
+        .unchecked_transaction()
+        .context("failed to begin post_tags transaction")?;
+    {
+        match (topic_filter, full_archive) {
+            (None, true) => {
+                tx.execute("DELETE FROM post_tags", [])
+                    .context("failed to clear post_tags")?;
+            }
+            (None, false) => {
+                let mut delete = tx
+                    .prepare("DELETE FROM post_tags WHERE reddit_fullname = ?1")
+                    .context("failed to prepare post_tags delete")?;
+                for fullname in processed_fullnames {
+                    delete
+                        .execute(params![fullname])
+                        .context("failed to delete stale post_tags rows")?;
+                }
+            }
+            (Some(topic), true) => {
+                tx.execute("DELETE FROM post_tags WHERE topic = ?1", params![topic])
+                    .context("failed to delete stale post_tags rows")?;
+            }
+            (Some(topic), false) => {
+                let mut delete = tx
+                    .prepare("DELETE FROM post_tags WHERE topic = ?1 AND reddit_fullname = ?2")
+                    .context("failed to prepare post_tags delete")?;
+                for fullname in processed_fullnames {
+                    delete
+                        .execute(params![topic, fullname])
+                        .context("failed to delete stale post_tags row")?;
+                }
+            }
+        }
+
+        let mut insert = tx
+            .prepare(
+                r#"INSERT INTO post_tags (
+                    reddit_fullname, topic, score, threshold, passed,
+                    matched_rules, signals, ruleset_version, tagged_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+            )
+            .context("failed to prepare post_tags insert")?;
+        for tag in tags {
+            let matched_rules = serde_json::to_string(&tag.matched_rules)
+                .context("failed to serialize matched_rules")?;
+            let signals =
+                serde_json::to_string(&tag.signals).context("failed to serialize signals")?;
+            insert
+                .execute(params![
+                    tag.reddit_fullname,
+                    tag.topic,
+                    tag.score,
+                    tag.threshold,
+                    tag.passed as i64,
+                    matched_rules,
+                    signals,
+                    tag.ruleset_version,
+                    tag.tagged_at,
+                ])
+                .context("failed to insert post_tags row")?;
+        }
+    }
+    tx.commit().context("failed to commit post_tags")?;
+    Ok(tags.len())
+}
+
+/// List materialized tags, newest-scoring first, optionally one topic and/or
+/// only passing rows. Powers `tag --json` and read queries.
+pub fn list_post_tags(
+    conn: &Connection,
+    topic: Option<&str>,
+    passed_only: bool,
+    limit: usize,
+    offset: usize,
+) -> Result<Vec<PostTag>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT reddit_fullname, topic, score, threshold, passed,
+                matched_rules, signals, ruleset_version, tagged_at
+         FROM post_tags
+         WHERE (?1 IS NULL OR topic = ?1)
+           AND (?2 = 0 OR passed = 1)
+         ORDER BY topic ASC, score DESC, reddit_fullname ASC
+         LIMIT ?3 OFFSET ?4",
+    )?;
+    let rows = stmt
+        .query_map(
+            params![topic, passed_only as i64, limit, offset],
+            post_tag_from_row,
+        )
+        .context("failed to query post_tags")?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to collect post_tags")
+}
+
+/// All tags for a single post, ordered by topic. Useful for inspection/tests.
+pub fn post_tags_for(conn: &Connection, reddit_fullname: &str) -> Result<Vec<PostTag>> {
+    let mut stmt = conn.prepare(
+        "SELECT reddit_fullname, topic, score, threshold, passed,
+                matched_rules, signals, ruleset_version, tagged_at
+         FROM post_tags
+         WHERE reddit_fullname = ?1
+         ORDER BY topic ASC",
+    )?;
+    let rows = stmt
+        .query_map(params![reddit_fullname], post_tag_from_row)
+        .context("failed to query post_tags for post")?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to collect post_tags for post")
+}
+
+fn post_tag_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PostTag> {
+    let matched_rules_raw: String = row.get(5)?;
+    let signals_raw: Option<String> = row.get(6)?;
+    // Propagate corruption rather than silently returning empty provenance.
+    let matched_rules: Vec<String> = serde_json::from_str(&matched_rules_raw).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(err))
+    })?;
+    let signals: BTreeMap<String, f32> = signals_raw
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(err))
+        })?
+        .unwrap_or_default();
+    Ok(PostTag {
+        reddit_fullname: row.get(0)?,
+        topic: row.get(1)?,
+        score: row.get(2)?,
+        threshold: row.get(3)?,
+        passed: row.get::<_, i64>(4)? != 0,
+        matched_rules,
+        signals,
+        ruleset_version: row.get(7)?,
+        tagged_at: row.get(8)?,
     })
 }
 
@@ -827,6 +1518,255 @@ mod tests {
     }
 
     #[test]
+    fn fts_triggers_keep_index_in_sync() {
+        let conn = test_db();
+        let mut post = test_post();
+        post.title = "Alpha Title".to_string();
+        post.content_markdown = Some("alpha body".to_string());
+        upsert_post(&conn, &post).expect("post should insert");
+
+        let hits = search_posts(&conn, "alpha", &SearchFilters::default(), 10)
+            .expect("inserted post should search");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].reddit_fullname, "t3_test123");
+
+        post.title = "Beta Title".to_string();
+        post.content_markdown = Some("beta body".to_string());
+        upsert_post(&conn, &post).expect("post should update");
+
+        let old_hits = search_posts(&conn, "alpha", &SearchFilters::default(), 10)
+            .expect("old terms should search");
+        assert!(old_hits.is_empty());
+        let new_hits = search_posts(&conn, "beta", &SearchFilters::default(), 10)
+            .expect("new terms should search");
+        assert_eq!(new_hits.len(), 1);
+
+        conn.execute(
+            "DELETE FROM saved_posts WHERE reddit_fullname = ?",
+            params![post.reddit_fullname],
+        )
+        .expect("post should delete");
+        let deleted_hits = search_posts(&conn, "beta", &SearchFilters::default(), 10)
+            .expect("deleted terms should search");
+        assert!(deleted_hits.is_empty());
+    }
+
+    #[test]
+    fn init_db_rebuilds_fts_for_preexisting_rows() {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "rusty_rss_fts_backfill_test_{}_{}.db",
+            std::process::id(),
+            id
+        ));
+        let conn = Connection::open(&path).expect("db should open");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE saved_posts (
+                reddit_fullname TEXT PRIMARY KEY,
+                reddit_id TEXT,
+                title TEXT NOT NULL,
+                author TEXT,
+                subreddit TEXT,
+                permalink TEXT NOT NULL,
+                outbound_url TEXT,
+                content_markdown TEXT,
+                thumbnail_url TEXT,
+                published_at TEXT,
+                updated_at TEXT,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'atom',
+                raw_entry TEXT
+            );
+            INSERT INTO saved_posts (
+                reddit_fullname, reddit_id, title, permalink, content_markdown,
+                first_seen_at, last_seen_at, source
+            ) VALUES (
+                't3_backfill', 'backfill', 'Backfill Searchable Title',
+                'https://reddit.com/r/rust/comments/backfill/', 'legacy markdown content',
+                '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'atom'
+            );
+            "#,
+        )
+        .expect("preexisting schema should be created");
+        drop(conn);
+
+        let conn = init_db(&path).expect("init should create and rebuild FTS");
+        let hits = search_posts(&conn, "searchable", &SearchFilters::default(), 10)
+            .expect("backfilled rows should search");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].reddit_fullname, "t3_backfill");
+    }
+
+    #[test]
+    fn search_ranking_prefers_title_matches() {
+        let conn = test_db();
+        let mut title_match = test_post();
+        title_match.reddit_fullname = "t3_title".to_string();
+        title_match.reddit_id = "title".to_string();
+        title_match.title = "Needle in title".to_string();
+        title_match.content_markdown = Some("unrelated content".to_string());
+        upsert_post(&conn, &title_match).expect("title match should insert");
+
+        let mut body_match = test_post();
+        body_match.reddit_fullname = "t3_body".to_string();
+        body_match.reddit_id = "body".to_string();
+        body_match.title = "Other post".to_string();
+        body_match.content_markdown = Some("needle in body".to_string());
+        upsert_post(&conn, &body_match).expect("body match should insert");
+
+        let hits = search_posts(&conn, "needle", &SearchFilters::default(), 10)
+            .expect("search should succeed");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].reddit_fullname, "t3_title");
+        assert!(hits[0].snippet.contains("<mark>"));
+    }
+
+    #[test]
+    fn search_filters_compose() {
+        let conn = test_db();
+        for (fullname, subreddit, author) in [
+            ("t3_rust_alice", "rust", "alice"),
+            ("t3_rust_bob", "rust", "bob"),
+            ("t3_go_alice", "golang", "alice"),
+        ] {
+            let mut post = test_post();
+            post.reddit_fullname = fullname.to_string();
+            post.reddit_id = fullname.trim_start_matches("t3_").to_string();
+            post.title = "Composed filter target".to_string();
+            post.subreddit = Some(subreddit.to_string());
+            post.author = Some(author.to_string());
+            upsert_post(&conn, &post).expect("post should insert");
+        }
+
+        let hits = search_posts(
+            &conn,
+            "target",
+            &SearchFilters {
+                subreddit: Some("rust".to_string()),
+                author: Some("alice".to_string()),
+            },
+            10,
+        )
+        .expect("filtered search should succeed");
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].reddit_fullname, "t3_rust_alice");
+    }
+
+    #[test]
+    fn export_records_include_latest_enrichment_and_capture() {
+        let conn = test_db();
+        let post = test_post();
+        upsert_post(&conn, &post).expect("post should insert");
+        record_enrichment_success(
+            &conn,
+            "t3_test123",
+            "provider",
+            "model",
+            "prompt",
+            "raw",
+            &test_output(RecommendedAction::ShouldBuild, "export summary"),
+        )
+        .expect("enrichment should insert");
+        upsert_outbound_capture(
+            &conn,
+            &OutboundCaptureUpsert {
+                reddit_fullname: "t3_test123".to_string(),
+                original_url: "https://example.com/original".to_string(),
+                final_url: Some("https://example.com/final".to_string()),
+                canonical_url: Some("https://example.com/canonical".to_string()),
+                title: Some("Captured title".to_string()),
+                description: Some("Captured description".to_string()),
+                site_name: Some("Example".to_string()),
+                preview_image_url: Some("https://example.com/image.png".to_string()),
+                content_markdown: Some("Captured snapshot".to_string()),
+                content_hash: Some("sha256:test".to_string()),
+                status: "success".to_string(),
+                http_status: Some(200),
+                error: None,
+            },
+        )
+        .expect("capture should insert");
+
+        let records = list_export_records(
+            &conn,
+            &ExportFilters {
+                recommended_action: Some(RecommendedAction::ShouldBuild),
+                ..ExportFilters::default()
+            },
+            10,
+            0,
+        )
+        .expect("export should query");
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].schema_version, "rusty-rss.export.v1");
+        assert_eq!(records[0].saved_post.reddit_fullname, "t3_test123");
+        assert_eq!(
+            records[0]
+                .latest_enrichment
+                .as_ref()
+                .and_then(|record| record.output.as_ref())
+                .map(|output| output.recommended_action),
+            Some(RecommendedAction::ShouldBuild)
+        );
+        assert_eq!(
+            records[0]
+                .outbound_capture
+                .as_ref()
+                .and_then(|capture| capture.title.as_deref()),
+            Some("Captured title")
+        );
+    }
+
+    #[test]
+    fn successful_outbound_capture_removes_candidate() {
+        let conn = test_db();
+        let mut post = test_post();
+        post.outbound_url = Some("https://example.com/post".to_string());
+        upsert_post(&conn, &post).expect("post should insert");
+
+        let candidates = list_outbound_capture_candidates(&conn, 10).expect("candidates query");
+        assert_eq!(candidates.len(), 1);
+
+        upsert_outbound_capture(
+            &conn,
+            &OutboundCaptureUpsert {
+                reddit_fullname: "t3_test123".to_string(),
+                original_url: "https://example.com/post".to_string(),
+                final_url: Some("https://example.com/post".to_string()),
+                canonical_url: None,
+                title: Some("Captured".to_string()),
+                description: None,
+                site_name: None,
+                preview_image_url: None,
+                content_markdown: None,
+                content_hash: None,
+                status: "success".to_string(),
+                http_status: Some(200),
+                error: None,
+            },
+        )
+        .expect("capture should insert");
+
+        let candidates = list_outbound_capture_candidates(&conn, 10).expect("candidates query");
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn malformed_search_query_fails_cleanly() {
+        let conn = test_db();
+        let post = test_post();
+        upsert_post(&conn, &post).expect("post should insert");
+
+        let err = search_posts(&conn, "\"unterminated", &SearchFilters::default(), 10)
+            .expect_err("malformed query should fail");
+        assert!(err.to_string().contains("invalid search query"));
+    }
+
+    #[test]
     fn idempotent_sync() {
         let conn = test_db();
         let post = test_post();
@@ -900,6 +1840,11 @@ mod tests {
             )
             .expect("migrated markdown should exist");
         assert_eq!(migrated, "Hello **Markdown**");
+
+        let hits = search_posts(&conn, "Markdown", &SearchFilters::default(), 10)
+            .expect("migrated markdown should search");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].reddit_fullname, "t3_old");
     }
 
     #[test]

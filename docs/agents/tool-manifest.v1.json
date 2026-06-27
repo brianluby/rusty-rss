@@ -1,0 +1,429 @@
+{
+  "schema_version": "rusty-rss.tool-manifest.v1",
+  "application": "rusty-rss",
+  "default_database_path": "./rusty-rss.sqlite3",
+  "stable_export_schema": "rusty-rss.export.v1",
+  "environment": {
+    "RUSTY_RSS_FEED_URL": {
+      "used_by": ["sync"],
+      "required_for": ["sync"],
+      "description": "Reddit saved RSS or Atom feed URL."
+    },
+    "RUSTY_RSS_DB_PATH": {
+      "used_by": ["rusty-rss", "rusty-rss-mcp"],
+      "default": "./rusty-rss.sqlite3",
+      "description": "SQLite database path."
+    },
+    "RUSTY_RSS_USER_AGENT": {
+      "used_by": ["sync"],
+      "default": "rusty-rss/0.1.0",
+      "description": "User agent for feed requests."
+    },
+    "RUSTY_RSS_OPENAI_BASE_URL": {
+      "used_by": ["enrich"],
+      "default": "http://127.0.0.1:8080/v1",
+      "description": "OpenAI-compatible API base URL."
+    },
+    "RUSTY_RSS_OPENAI_MODEL": {
+      "used_by": ["enrich"],
+      "default": "llama.cpp",
+      "description": "OpenAI-compatible model ID."
+    },
+    "RUSTY_RSS_OPENAI_API_KEY": {
+      "used_by": ["enrich"],
+      "description": "Optional bearer token for the OpenAI-compatible endpoint."
+    }
+  },
+  "cli": {
+    "binary": "rusty-rss",
+    "global_options": [
+      {
+        "name": "--feed-url",
+        "env": "RUSTY_RSS_FEED_URL",
+        "value": "FEED_URL"
+      },
+      {
+        "name": "--db-path",
+        "short": "-d",
+        "env": "RUSTY_RSS_DB_PATH",
+        "value": "DB_PATH",
+        "default": "./rusty-rss.sqlite3"
+      }
+    ],
+    "commands": [
+      {
+        "name": "sync",
+        "purpose": "Fetch saved feed pages and upsert saved posts.",
+        "mutability": "write-db",
+        "network": true,
+        "llm": false,
+        "requires_feed_url": true,
+        "writes": ["saved_posts", "sync_runs"],
+        "options": [
+          {
+            "name": "--limit",
+            "type": "integer",
+            "default": 100,
+            "description": "Saved items requested per Reddit page."
+          },
+          {
+            "name": "--max-pages",
+            "type": "integer",
+            "default": 50,
+            "description": "Maximum Reddit pages to fetch."
+          }
+        ],
+        "output": "human-text"
+      },
+      {
+        "name": "list",
+        "purpose": "List recent saved posts.",
+        "mutability": "read-only",
+        "network": false,
+        "llm": false,
+        "options": [
+          {
+            "name": "--limit",
+            "short": "-l",
+            "type": "integer",
+            "default": 20
+          },
+          {
+            "name": "--offset",
+            "short": "-o",
+            "type": "integer",
+            "default": 0
+          }
+        ],
+        "output": "human-text"
+      },
+      {
+        "name": "show",
+        "purpose": "Show one saved post by Reddit fullname.",
+        "mutability": "read-only",
+        "network": false,
+        "llm": false,
+        "arguments": [
+          {
+            "name": "fullname",
+            "type": "string",
+            "required": true
+          }
+        ],
+        "output": "human-text"
+      },
+      {
+        "name": "search",
+        "purpose": "Search saved post titles and Markdown content.",
+        "mutability": "read-only",
+        "network": false,
+        "llm": false,
+        "arguments": [
+          {
+            "name": "query",
+            "type": "string",
+            "required": true
+          }
+        ],
+        "options": [
+          {
+            "name": "--limit",
+            "short": "-l",
+            "type": "integer",
+            "default": 20
+          },
+          {
+            "name": "--subreddit",
+            "type": "string"
+          },
+          {
+            "name": "--author",
+            "type": "string"
+          },
+          {
+            "name": "--json",
+            "type": "boolean",
+            "default": false
+          }
+        ],
+        "output": "human-text or ndjson"
+      },
+      {
+        "name": "enrich",
+        "purpose": "Classify unenriched posts through an OpenAI-compatible LLM endpoint.",
+        "mutability": "write-db",
+        "network": true,
+        "llm": true,
+        "writes": ["enrichment_runs"],
+        "options": [
+          {
+            "name": "--limit",
+            "short": "-l",
+            "type": "integer",
+            "default": 20
+          },
+          {
+            "name": "--dry-run",
+            "type": "boolean",
+            "default": false,
+            "mutability_when_set": "read-only",
+            "network_when_set": false
+          }
+        ],
+        "output": "human-text"
+      },
+      {
+        "name": "triage",
+        "purpose": "List views derived from latest enrichment data.",
+        "mutability": "read-only",
+        "network": false,
+        "llm": false,
+        "arguments": [
+          {
+            "name": "view",
+            "type": "string",
+            "required": true,
+            "values": [
+              "all",
+              "unprocessed",
+              "high-value",
+              "should-test",
+              "should-build",
+              "reading-queue",
+              "reference-only",
+              "discard"
+            ]
+          }
+        ],
+        "options": [
+          {
+            "name": "--limit",
+            "short": "-l",
+            "type": "integer",
+            "default": 20
+          },
+          {
+            "name": "--offset",
+            "short": "-o",
+            "type": "integer",
+            "default": 0
+          },
+          {
+            "name": "--json",
+            "type": "boolean",
+            "default": false
+          }
+        ],
+        "output": "human-text or ndjson"
+      },
+      {
+        "name": "export",
+        "purpose": "Export saved posts with latest enrichment and outbound capture.",
+        "mutability": "read-only",
+        "network": false,
+        "llm": false,
+        "options": [
+          {
+            "name": "--format",
+            "type": "enum",
+            "default": "jsonl",
+            "values": ["jsonl", "markdown", "csv"]
+          },
+          {
+            "name": "--limit",
+            "short": "-l",
+            "type": "integer",
+            "default": 100
+          },
+          {
+            "name": "--offset",
+            "short": "-o",
+            "type": "integer",
+            "default": 0
+          },
+          {
+            "name": "--classification",
+            "type": "enum",
+            "values": [
+              "article",
+              "tool",
+              "tutorial",
+              "reference",
+              "discussion",
+              "question",
+              "news",
+              "other"
+            ]
+          },
+          {
+            "name": "--action",
+            "type": "enum",
+            "values": [
+              "should_test",
+              "should_build",
+              "reading_queue",
+              "reference_only",
+              "discard",
+              "other"
+            ]
+          },
+          {
+            "name": "--min-joy",
+            "type": "number",
+            "semantic_range": [0.0, 1.0]
+          },
+          {
+            "name": "--min-work",
+            "type": "number",
+            "semantic_range": [0.0, 1.0]
+          }
+        ],
+        "output": "jsonl, markdown, or csv"
+      },
+      {
+        "name": "capture",
+        "purpose": "Fetch outbound page metadata for saved posts.",
+        "mutability": "write-db",
+        "network": true,
+        "llm": false,
+        "writes": ["outbound_captures"],
+        "options": [
+          {
+            "name": "--limit",
+            "short": "-l",
+            "type": "integer",
+            "default": 20
+          }
+        ],
+        "output": "human-text"
+      },
+      {
+        "name": "tag",
+        "purpose": "Tag saved posts by topic with the Gate 1 rule engine.",
+        "mutability": "write-db",
+        "network": false,
+        "llm": false,
+        "writes": ["post_tags"],
+        "options": [
+          {
+            "name": "--topic",
+            "type": "string",
+            "default": null
+          },
+          {
+            "name": "--rules",
+            "type": "string",
+            "default": "./rules.toml"
+          },
+          {
+            "name": "--limit",
+            "type": "integer",
+            "default": null
+          },
+          {
+            "name": "--dry-run",
+            "type": "boolean",
+            "default": false
+          },
+          {
+            "name": "--json",
+            "type": "boolean",
+            "default": false
+          }
+        ],
+        "output": "human-text-or-ndjson"
+      }
+    ]
+  },
+  "mcp": {
+    "binary": "rusty-rss-mcp",
+    "transport": "stdio",
+    "mutability": "read-only",
+    "tools": [
+      {
+        "name": "query_posts",
+        "alias_for": "search_posts",
+        "purpose": "Agent-friendly alias for archive search.",
+        "input_schema": {
+          "type": "object",
+          "required": ["query"],
+          "properties": {
+            "query": {
+              "type": "string"
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 100,
+              "default": 20
+            },
+            "subreddit": {
+              "type": "string"
+            },
+            "author": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      {
+        "name": "search_posts",
+        "purpose": "Search saved Reddit posts by title and Markdown content.",
+        "input_schema": {
+          "type": "object",
+          "required": ["query"],
+          "properties": {
+            "query": {
+              "type": "string"
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 100,
+              "default": 20
+            },
+            "subreddit": {
+              "type": "string"
+            },
+            "author": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      {
+        "name": "list_posts",
+        "purpose": "List saved Reddit posts ordered by last-seen time.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "limit": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 100,
+              "default": 20
+            },
+            "offset": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0
+            }
+          }
+        }
+      },
+      {
+        "name": "show_post",
+        "purpose": "Show one saved Reddit post by reddit fullname.",
+        "input_schema": {
+          "type": "object",
+          "required": ["fullname"],
+          "properties": {
+            "fullname": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    ]
+  }
+}
