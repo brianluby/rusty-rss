@@ -2,8 +2,8 @@
 
 `rusty-rss-core` mixes two error styles on purpose:
 
-- **`anyhow::Result`** for the DB (`db::*`), search (`search::*`), and capture
-  (`capture::*`) APIs.
+- **`anyhow::Result`** for the DB and search (`db::*`, including the `db::search`
+  full-text-search API re-exported from `db`) and capture (`capture::*`) APIs.
 - **Typed `thiserror` enums** at the one boundary where a caller actually
   branches on the failure class: `llm::EnrichError`
   (`crates/rusty-rss-core/src/llm.rs:20`).
