@@ -1,9 +1,8 @@
 //! HTTP fetch and HTML metadata extraction for a single captured URL.
 
 use super::options::CapturedMetadata;
-use super::security::validate_capture_url;
+use super::security::{CaptureClient, validate_capture_url};
 use anyhow::{Context, Result, anyhow};
-use reqwest::Client;
 use scraper::{Html, Selector};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
@@ -12,22 +11,17 @@ use url::Url;
 const TIMEOUT_SECS: u64 = 20;
 const MAX_CAPTURE_BYTES: u64 = 1024 * 1024;
 
-pub async fn capture_url(
-    client: &Client,
-    url: &str,
-    allow_private_hosts: bool,
-) -> Result<CapturedMetadata> {
-    validate_capture_url(url, allow_private_hosts).await?;
+pub async fn capture_url(client: &CaptureClient, url: &str) -> Result<CapturedMetadata> {
+    validate_capture_url(url, client.allow_private_hosts()).await?;
     do_capture_url(client, url).await
 }
 
 pub(super) async fn capture_url_with_retries(
-    client: &Client,
+    client: &CaptureClient,
     url: &str,
-    allow_private_hosts: bool,
     max_retries: usize,
 ) -> Result<CapturedMetadata> {
-    validate_capture_url(url, allow_private_hosts).await?;
+    validate_capture_url(url, client.allow_private_hosts()).await?;
     let mut last_err = None;
 
     for attempt in 1..=max_retries.max(1) {
@@ -45,8 +39,9 @@ pub(super) async fn capture_url_with_retries(
     Err(last_err.unwrap_or_else(|| anyhow!("capture retries exhausted")))
 }
 
-async fn do_capture_url(client: &Client, url: &str) -> Result<CapturedMetadata> {
+async fn do_capture_url(client: &CaptureClient, url: &str) -> Result<CapturedMetadata> {
     let mut response = client
+        .inner()
         .get(url)
         .timeout(Duration::from_secs(TIMEOUT_SECS))
         .send()
@@ -178,7 +173,7 @@ mod tests {
         );
         let client = build_capture_client("rusty-rss-test/1.0", true);
 
-        let metadata = capture_url(&client, &url, true)
+        let metadata = capture_url(&client, &url)
             .await
             .expect("capture should succeed");
 
@@ -219,7 +214,7 @@ mod tests {
         );
         let client = build_capture_client("rusty-rss-test/1.0", true);
 
-        let metadata = capture_url_with_retries(&client, &url, true, 2)
+        let metadata = capture_url_with_retries(&client, &url, 2)
             .await
             .expect("retry should eventually succeed");
 
@@ -231,10 +226,28 @@ mod tests {
         let url = serve_oversized_no_length();
         let client = build_capture_client("rusty-rss-test/1.0", true);
 
-        let err = capture_url(&client, &url, true)
+        let err = capture_url(&client, &url)
             .await
             .expect_err("oversized streamed body should be rejected");
 
         assert!(err.to_string().contains("too large"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn capture_url_enforces_client_private_host_policy() {
+        // The CaptureClient carries the allow_private_hosts policy, so capture_url
+        // derives the validate pre-check from it. There is no separate per-call
+        // flag a caller could set to disagree with the client's resolver, which
+        // is what would otherwise re-open the DNS-rebinding window.
+        let client = build_capture_client("rusty-rss-test/1.0", false);
+
+        let err = capture_url(&client, "http://127.0.0.1:9/private")
+            .await
+            .expect_err("a strict client must block a loopback URL");
+
+        assert!(
+            err.to_string().contains("blocked private outbound host"),
+            "got: {err}"
+        );
     }
 }

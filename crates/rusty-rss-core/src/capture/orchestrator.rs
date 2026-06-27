@@ -37,15 +37,9 @@ pub async fn capture_outbound_metadata(
             .await
             .context("capture semaphore closed")?;
         let client = client.clone();
-        let allow_private_hosts = options.allow_private_hosts;
         tasks.spawn(async move {
-            let result = capture_url_with_retries(
-                &client,
-                &candidate.outbound_url,
-                allow_private_hosts,
-                max_retries,
-            )
-            .await;
+            let result =
+                capture_url_with_retries(&client, &candidate.outbound_url, max_retries).await;
             drop(permit);
             (candidate, result)
         });

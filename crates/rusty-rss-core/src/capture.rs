@@ -17,4 +17,4 @@ mod test_support;
 pub use fetch::capture_url;
 pub use options::{CaptureOptions, CaptureSummary, CapturedMetadata};
 pub use orchestrator::capture_outbound_metadata;
-pub use security::build_capture_client;
+pub use security::{CaptureClient, build_capture_client};
