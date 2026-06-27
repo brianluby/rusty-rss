@@ -357,21 +357,34 @@ fn is_blocked_ip(ip: IpAddr) -> bool {
     };
     match ip {
         IpAddr::V4(ip) => {
+            let [a, b, _, _] = ip.octets();
             ip.is_private()
                 || ip.is_loopback()
                 || ip.is_link_local()
+                || ip.is_multicast()
                 || ip.is_broadcast()
                 || ip.is_documentation()
                 || ip.is_unspecified()
+                // CGNAT / shared address space, 100.64.0.0/10.
+                || (a == 100 && (64..=127).contains(&b))
+                // Benchmarking, 198.18.0.0/15.
+                || (a == 198 && (b == 18 || b == 19))
+                // Reserved (incl. future use), 240.0.0.0/4.
+                || a >= 240
         }
         IpAddr::V6(ip) => {
-            let first = ip.segments()[0];
+            let segments = ip.segments();
+            let first = segments[0];
             ip.is_loopback()
                 || ip.is_unspecified()
                 // Unique local addresses, fc00::/7.
                 || (first & 0xfe00) == 0xfc00
                 // Link-local unicast, fe80::/10 (the old 0xfe00 mask never matched).
                 || (first & 0xffc0) == 0xfe80
+                // Multicast, ff00::/8.
+                || (first & 0xff00) == 0xff00
+                // Documentation, 2001:db8::/32.
+                || (segments[0] == 0x2001 && segments[1] == 0x0db8)
         }
     }
 }
@@ -730,6 +743,12 @@ mod tests {
             "::1",              // IPv6 loopback
             "fe80::1",          // link-local fe80::/10
             "fc00::1",          // unique local fc00::/7
+            "ff02::1",          // IPv6 multicast ff00::/8
+            "2001:db8::1",      // IPv6 documentation 2001:db8::/32
+            "100.64.0.1",       // CGNAT 100.64.0.0/10
+            "198.18.0.1",       // benchmarking 198.18.0.0/15
+            "240.0.0.1",        // reserved 240.0.0.0/4
+            "224.0.0.1",        // IPv4 multicast 224.0.0.0/4
         ];
         for addr in blocked {
             assert!(

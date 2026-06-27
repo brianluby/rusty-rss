@@ -112,10 +112,14 @@ CREATE INDEX idx_post_tags_score ON post_tags(topic, score DESC);
 Design choices:
 
 - Primary key `(reddit_fullname, topic)` — a post can hold many topics (multi-label).
-- **Upsert** on re-tag, same reasoning as `outbound_captures`: consumers want current
-  tags, not a history of every run.
-- Write a row whenever **any** signal fires (`score > 0`), with a `passed` flag, so
-  near-misses stay queryable and the threshold can be tuned without re-running.
+- **Replace on re-tag** (as shipped): rather than a plain upsert, the `tag` command
+  deletes the processed scope and re-inserts within a transaction (`db::replace_post_tags`),
+  so a post that stops matching — or a topic removed from the ruleset — loses its
+  stale rows. Consumers want current tags, not a history of every run.
+- Write a row whenever a **scoring rule** fires, including below-threshold and vetoed
+  results, with a `passed` flag, so near-misses stay queryable and a new threshold can
+  be applied at query time via the stored `score`. (A subreddit prior alone does not
+  create a row.)
 - `ruleset_version` mirrors `enrichment_runs.prompt_version`; it ties each tag to the
   rules that produced it and powers the feedback loop.
 

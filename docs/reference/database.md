@@ -111,10 +111,12 @@ keyed by `(reddit_fullname, topic)` for multi-label tagging.
 | `ruleset_version` | `[meta].version` from the rules file that produced the row. |
 | `tagged_at` | Tagging run timestamp. |
 
-A row exists only when at least one scoring rule fired (near-misses included).
-Indexes exist for `(topic, passed)` and `(topic, score DESC)`. The `tag` command
-deletes the processed scope and re-inserts within a transaction, so the table
-always reflects the current rules.
+A row exists only when at least one scoring rule fired (near-misses included); a
+subreddit prior alone never creates a row. Indexes exist for `(topic, passed)`
+and `(topic, score DESC)`. The `tag` command deletes the processed scope and
+re-inserts within a transaction, so that scope reflects the current rules — a
+full run covers the whole archive, while a `--limit` run refreshes only the
+processed subset.
 
 ## `posts_fts`
 
