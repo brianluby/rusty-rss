@@ -9,7 +9,7 @@
 //! `rusqlite::Connection` is `!Send + !Sync`, so it cannot be held across an
 //! `.await` or stored in the (Send + Sync) handler. Each tool therefore performs
 //! its database work inside [`tokio::task::spawn_blocking`], opening a fresh
-//! short-lived connection per call via [`crate::config::open_existing_db`]. This
+//! short-lived connection per call via [`crate::config::open_readonly_db`]. This
 //! keeps the async runtime unblocked and sidesteps the `Send` requirement
 //! entirely — the connection never crosses an await point.
 
@@ -114,7 +114,7 @@ impl RustyRssServer {
     {
         let db_path = Arc::clone(&self.db_path);
         let outcome = tokio::task::spawn_blocking(move || {
-            let conn = crate::config::open_existing_db(&db_path)?;
+            let conn = crate::config::open_readonly_db(&db_path)?;
             f(&conn)
         })
         .await

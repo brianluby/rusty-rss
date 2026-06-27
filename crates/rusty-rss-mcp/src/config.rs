@@ -5,10 +5,10 @@
 //! the stdout JSON-RPC channel. Only `--db-path`/`-d` and `RUSTY_RSS_DB_PATH`
 //! are honored, matching the previous server and the wider CLI convention.
 
-use anyhow::{Result, anyhow};
-use rusqlite::Connection;
-use rusty_rss_core::db;
+use anyhow::{Context, Result, anyhow};
+use rusqlite::{Connection, OpenFlags};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// Default database path when neither flag nor env var is provided.
 const DEFAULT_DB_PATH: &str = "./rusty-rss.sqlite3";
@@ -60,14 +60,35 @@ pub fn ensure_db_exists(db_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Open a connection to an existing archive, refusing to create a new one.
+/// Open a strictly read-only connection to an existing archive.
 ///
 /// Every tool call opens its own short-lived connection through this helper
-/// (inside `spawn_blocking`), keeping the re-validation of existence immediately
-/// before use so a database deleted mid-session fails closed too.
-pub fn open_existing_db(db_path: &Path) -> Result<Connection> {
-    ensure_db_exists(db_path)?;
-    db::init_db(db_path)
+/// (inside `spawn_blocking`). Using `SQLITE_OPEN_READ_ONLY` with no `CREATE`
+/// flag makes this fail-closed in two ways at the SQLite layer itself:
+///
+/// 1. A missing file is refused atomically (no TOCTOU window, no silently
+///    re-created empty database) — so no separate existence pre-check is needed.
+/// 2. Every write is rejected by SQLite, which guarantees the read path never
+///    runs the shared `db::init_db` migrations (FTS rebuild, `ALTER TABLE`,
+///    content-HTML→Markdown `UPDATE`) on a user's archive during a tool call.
+pub fn open_readonly_db(db_path: &Path) -> Result<Connection> {
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| {
+        format!(
+            "failed to open database read-only at {}; run `rusty-rss sync` first or pass a correct --db-path",
+            db_path.display()
+        )
+    })?;
+
+    // Wait on a contended lock instead of failing immediately with SQLITE_BUSY
+    // when a concurrent writer (the CLI) holds the database.
+    conn.busy_timeout(Duration::from_secs(5))
+        .context("failed to configure busy timeout")?;
+
+    Ok(conn)
 }
 
 #[cfg(test)]
@@ -120,5 +141,55 @@ mod tests {
     fn ensure_db_exists_rejects_directory() {
         let err = ensure_db_exists(&std::env::temp_dir()).unwrap_err();
         assert!(err.to_string().contains("database file not found"), "{err}");
+    }
+
+    fn unique_path(tag: &str) -> PathBuf {
+        let id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "rusty_rss_mcp_cfg_{tag}_{}_{id}.sqlite3",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn open_readonly_db_refuses_missing_file_without_creating_it() {
+        let missing = unique_path("missing");
+        let _ = std::fs::remove_file(&missing);
+
+        let err = open_readonly_db(&missing).unwrap_err();
+        assert!(
+            err.to_string().contains("read-only"),
+            "error should be fail-closed and legible: {err}"
+        );
+        // Fail-closed contract: the server must NEVER create a database file when
+        // pointed at a missing path (SQLITE_OPEN_READ_ONLY has no CREATE flag).
+        assert!(
+            !missing.exists(),
+            "read-only open must not create {}",
+            missing.display()
+        );
+    }
+
+    #[test]
+    fn open_readonly_db_rejects_writes() {
+        use rusty_rss_core::db;
+
+        let path = unique_path("readonly");
+        let _ = std::fs::remove_file(&path);
+        // Create a real archive through the write path, then close it.
+        drop(db::init_db(&path).expect("init db"));
+
+        let conn = open_readonly_db(&path).expect("open read-only");
+        // Any write must be rejected by SQLite itself on a read-only connection.
+        let write = conn.execute_batch("CREATE TABLE should_not_exist (id INTEGER);");
+        assert!(
+            write.is_err(),
+            "read-only connection must reject writes, got {write:?}"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }

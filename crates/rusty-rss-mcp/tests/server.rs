@@ -90,12 +90,13 @@ fn fixture_db() -> PathBuf {
 async fn connect(db_path: PathBuf) -> Client {
     let (server_transport, client_transport) = tokio::io::duplex(8 * 1024);
     tokio::spawn(async move {
-        if let Ok(server) = rusty_rss_mcp::RustyRssServer::new(db_path)
+        let server = rusty_rss_mcp::RustyRssServer::new(db_path)
             .serve(server_transport)
             .await
-        {
-            let _ = server.waiting().await;
-        }
+            .expect("server should serve");
+        // `waiting()` returning is the normal shutdown path (client closed the
+        // transport), so its result is intentionally ignored.
+        let _ = server.waiting().await;
     });
     ().serve(client_transport)
         .await
@@ -281,10 +282,27 @@ async fn invalid_arguments_are_rejected() {
         .call_tool(CallToolRequestParams::new("search").with_arguments(args(json!({}))))
         .await
         .expect("call resolves");
+    // Assert the observable contract rather than rmcp's internal serde wording:
+    // a tool-level error result carrying some content.
     assert_eq!(result.is_error, Some(true), "got {result:?}");
     assert!(
-        first_text(&result).contains("query"),
-        "error should mention the missing field: {result:?}"
+        !result.content.is_empty(),
+        "error result should carry content: {result:?}"
+    );
+
+    // The `query` field being mandatory is part of the published contract: the
+    // search tool's JSON Schema must list it under `required`.
+    let tools = client.list_all_tools().await.expect("list tools");
+    let search = tools.iter().find(|t| t.name == "search").unwrap();
+    let required: Vec<&str> = search
+        .input_schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|r| r.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    assert!(
+        required.contains(&"query"),
+        "search schema must require query: {required:?}"
     );
 
     // An unknown triage view is rejected by our explicit validation, which
