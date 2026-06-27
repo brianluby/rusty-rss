@@ -339,11 +339,11 @@
     "binary": "rusty-rss-mcp",
     "transport": "stdio",
     "mutability": "read-only",
+    "sdk": "rmcp",
     "tools": [
       {
-        "name": "query_posts",
-        "alias_for": "search_posts",
-        "purpose": "Agent-friendly alias for archive search.",
+        "name": "search",
+        "purpose": "Full-text search over saved Reddit posts by title and Markdown content.",
         "input_schema": {
           "type": "object",
           "required": ["query"],
@@ -367,32 +367,7 @@
         }
       },
       {
-        "name": "search_posts",
-        "purpose": "Search saved Reddit posts by title and Markdown content.",
-        "input_schema": {
-          "type": "object",
-          "required": ["query"],
-          "properties": {
-            "query": {
-              "type": "string"
-            },
-            "limit": {
-              "type": "integer",
-              "minimum": 0,
-              "maximum": 100,
-              "default": 20
-            },
-            "subreddit": {
-              "type": "string"
-            },
-            "author": {
-              "type": "string"
-            }
-          }
-        }
-      },
-      {
-        "name": "list_posts",
+        "name": "list",
         "purpose": "List saved Reddit posts ordered by last-seen time.",
         "input_schema": {
           "type": "object",
@@ -412,14 +387,48 @@
         }
       },
       {
-        "name": "show_post",
-        "purpose": "Show one saved Reddit post by reddit fullname.",
+        "name": "show",
+        "purpose": "Show one saved Reddit post by reddit fullname; returns null when not found.",
         "input_schema": {
           "type": "object",
           "required": ["fullname"],
           "properties": {
             "fullname": {
               "type": "string"
+            }
+          }
+        }
+      },
+      {
+        "name": "triage",
+        "purpose": "List enrichment-driven triage items for a view.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "view": {
+              "type": "string",
+              "enum": [
+                "all",
+                "unprocessed",
+                "high-value",
+                "should-test",
+                "should-build",
+                "reading-queue",
+                "reference-only",
+                "discard"
+              ],
+              "default": "unprocessed"
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 100,
+              "default": 20
+            },
+            "offset": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0
             }
           }
         }

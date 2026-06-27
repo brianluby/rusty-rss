@@ -1,6 +1,6 @@
 # Search and Query the Archive
 
-Use `search` for human CLI searches and JSON records. Use MCP `query_posts` or `search_posts` when an agent has MCP access.
+Use `search` for human CLI searches and JSON records. Use the MCP `search` tool when an agent has MCP access.
 
 ## Search from the CLI
 
@@ -66,7 +66,7 @@ Start the read-only MCP server:
 rusty-rss-mcp --db-path ./rusty-rss.sqlite3
 ```
 
-Use `query_posts` for agent query workflows:
+Use `search` for agent query workflows:
 
 ```json
 {
@@ -76,10 +76,10 @@ Use `query_posts` for agent query workflows:
 }
 ```
 
-`query_posts` is an alias for `search_posts`. Both return the same search records as pretty-printed JSON in MCP text content.
+`search` returns search records as pretty-printed JSON in MCP text content.
 
 ## Pick the Right Surface
 
-- Use MCP `query_posts` when an agent needs read-only archive access.
+- Use MCP `search` when an agent needs read-only archive access.
 - Use CLI `search --json` when MCP is unavailable or a script needs newline-delimited JSON.
 - Use `export --format jsonl` when a consumer needs full saved post records with latest enrichment and outbound capture data.

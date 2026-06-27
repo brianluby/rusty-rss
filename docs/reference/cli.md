@@ -246,9 +246,9 @@ Options:
 | `-d, --db-path <PATH>` | `RUSTY_RSS_DB_PATH` | `./rusty-rss.sqlite3` | SQLite database path. |
 | `-h, --help` | none | none | Print usage. |
 
-Available tools:
+Available tools (built on the `rmcp` SDK, each with a JSON Schema for arguments):
 
-- `search_posts`
-- `query_posts`
-- `list_posts`
-- `show_post`
+- `search`
+- `list`
+- `show`
+- `triage`

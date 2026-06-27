@@ -21,10 +21,10 @@ rusty-rss-mcp --db-path ./rusty-rss.sqlite3
 
 Use these MCP tools:
 
-- `query_posts`: preferred agent query tool; alias for `search_posts`.
-- `search_posts`: search saved post titles and Markdown content.
-- `list_posts`: list recent saved posts.
-- `show_post`: fetch one saved post by fullname.
+- `search`: full-text search over saved post titles and Markdown content.
+- `list`: list recent saved posts.
+- `show`: fetch one saved post by fullname (returns null when not found).
+- `triage`: list enrichment-driven triage items for a view.
 
 These tools are read-only archive operations.
 
@@ -54,10 +54,10 @@ rusty-rss --db-path ./rusty-rss.sqlite3 export --format jsonl --limit 50
 
 Treat these as read-only archive operations:
 
-- MCP `query_posts`
-- MCP `search_posts`
-- MCP `list_posts`
-- MCP `show_post`
+- MCP `search`
+- MCP `list`
+- MCP `show`
+- MCP `triage`
 - CLI `list`
 - CLI `show`
 - CLI `search`
@@ -90,7 +90,7 @@ Use `export --format jsonl` for the stable full-record envelope. The schema vers
 
 ## Query Examples
 
-MCP `query_posts` arguments:
+MCP `search` arguments:
 
 ```json
 {
@@ -100,7 +100,7 @@ MCP `query_posts` arguments:
 }
 ```
 
-MCP `list_posts` arguments:
+MCP `list` arguments:
 
 ```json
 {
@@ -109,7 +109,7 @@ MCP `list_posts` arguments:
 }
 ```
 
-MCP `show_post` arguments:
+MCP `show` arguments:
 
 ```json
 {
@@ -117,14 +117,23 @@ MCP `show_post` arguments:
 }
 ```
 
+MCP `triage` arguments:
+
+```json
+{
+  "view": "should-build",
+  "limit": 20
+}
+```
+
 ## Tool Selection
 
 | Goal | Preferred tool | Fallback |
 | --- | --- | --- |
-| Search for saved posts | MCP `query_posts` | `rusty-rss search --json` |
-| Read one saved post | MCP `show_post` | `rusty-rss show` |
-| Browse recent posts | MCP `list_posts` | `rusty-rss list` |
-| Get enriched queue | `rusty-rss triage --json` | `rusty-rss export --format jsonl --action ...` |
+| Search for saved posts | MCP `search` | `rusty-rss search --json` |
+| Read one saved post | MCP `show` | `rusty-rss show` |
+| Browse recent posts | MCP `list` | `rusty-rss list` |
+| Get enriched queue | MCP `triage` or `rusty-rss triage --json` | `rusty-rss export --format jsonl --action ...` |
 | Bulk handoff | `rusty-rss export --format jsonl` | none |
 
 ## Machine-Readable Manifest
