@@ -32,11 +32,22 @@ APIs right now. Reasons:
 Reserve `thiserror` enums for boundaries where a caller needs to **branch on the
 variant**. The enrichment path is the established precedent:
 `EnrichError::{Transport, ModelUnavailable, Parse, Validation}`
-(`crates/rusty-rss-core/src/llm.rs:20-28`). Callers distinguish a transient
-`Transport`/`ModelUnavailable` failure (retry/skip the run) from a `Parse` or
-`Validation` failure (a bad model response, surfaced differently). That
-discrimination is the thing that justifies the typed enum; without it,
-`anyhow` is the right default.
+(`crates/rusty-rss-core/src/llm.rs:20-28`). The typed enum establishes the
+error-*class* **contract** at this boundary: it names the distinction between a
+transient `Transport`/`ModelUnavailable` failure (which warrants retry) and a
+`Parse`/`Validation` failure (a bad model response, which should be skipped
+immediately rather than retried).
+
+Note that this variant-aware behavior is **not yet implemented**. The only
+current caller, `enrich_with_retries`
+(`crates/rusty-rss-core/src/enrich.rs:94-116`), coerces every variant to a
+`String` via `err.to_string()` and retries them all identically
+(`Result<_, String>`). Class-driven handling — transient-only retry vs.
+immediate skip on `Parse`/`Validation` — is slated for the RSS-22 batch-runner
+work. The enum exists now so that contract is already encoded at the boundary
+and the future caller can branch on it without a signature change; that is what
+justifies the typed enum here. Where no boundary will ever branch on class,
+`anyhow` remains the right default.
 
 ## Masking findings already resolved (RSS-48)
 
