@@ -6,13 +6,43 @@ use crate::models::{
 use anyhow::{Context, Result};
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, params};
+use std::time::Duration;
 
 use super::posts::saved_post_from_row;
 
-pub fn list_enrichment_candidates(conn: &Connection, limit: usize) -> Result<Vec<SavedPost>> {
+/// Select posts that need enrichment, resumably and idempotently.
+///
+/// A post is a candidate when it has no *current* successful enrichment run,
+/// where "current" means a `status = 'success'` row whose `prompt_version`
+/// matches `prompt_version` and (when `stale_after` is set) whose `created_at`
+/// is newer than `now - stale_after`. This single `NOT EXISTS` predicate covers
+/// all three cases at once:
+///
+/// - **unenriched** — the post has no successful run at all;
+/// - **prompt changed** — every successful run used an older `prompt_version`,
+///   so the stored output predates the current rubric and is re-enriched;
+/// - **stale** — the newest successful run is older than the freshness window.
+///
+/// Because the predicate keys off persisted rows, re-running the batch never
+/// reselects a post that was just enriched under the current prompt within the
+/// window, so the selection is naturally resumable and idempotent.
+pub fn list_enrichment_candidates(
+    conn: &Connection,
+    limit: usize,
+    prompt_version: &str,
+    stale_after: Option<Duration>,
+) -> Result<Vec<SavedPost>> {
     if limit == 0 {
         return Ok(Vec::new());
     }
+
+    // Both timestamps are written as UTC RFC 3339 (`Utc::now().to_rfc3339()`),
+    // so a lexicographic `>=` over the stored strings is a correct chronological
+    // comparison. A `None` window binds SQL NULL and disables the age check.
+    let cutoff = stale_after.map(|window| {
+        let secs = i64::try_from(window.as_secs()).unwrap_or(i64::MAX);
+        (Utc::now() - chrono::Duration::seconds(secs)).to_rfc3339()
+    });
 
     let mut stmt = conn.prepare(
         "SELECT reddit_fullname, reddit_id, title, author, subreddit, permalink,
@@ -21,14 +51,17 @@ pub fn list_enrichment_candidates(conn: &Connection, limit: usize) -> Result<Vec
          FROM saved_posts p
          WHERE NOT EXISTS (
              SELECT 1 FROM enrichment_runs e
-             WHERE e.reddit_fullname = p.reddit_fullname AND e.status = 'success'
+             WHERE e.reddit_fullname = p.reddit_fullname
+               AND e.status = 'success'
+               AND e.prompt_version = ?1
+               AND (?2 IS NULL OR e.created_at >= ?2)
          )
          ORDER BY last_seen_at DESC
-         LIMIT ?",
+         LIMIT ?3",
     )?;
 
     let rows = stmt
-        .query_map(params![limit], saved_post_from_row)
+        .query_map(params![prompt_version, cutoff, limit], saved_post_from_row)
         .context("failed to query enrichment candidates")?;
 
     rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -412,12 +445,102 @@ mod tests {
     }
 
     #[test]
+    fn candidate_selection_covers_unenriched_prompt_change_and_staleness() {
+        let conn = test_db();
+        for fullname in ["t3_fresh", "t3_oldprompt", "t3_never"] {
+            let mut post = test_post();
+            post.reddit_fullname = fullname.to_string();
+            post.reddit_id = fullname.trim_start_matches("t3_").to_string();
+            upsert_post(&conn, &post).expect("post should insert");
+        }
+
+        // A current, successful run for t3_fresh under prompt-v2.
+        record_enrichment_success(
+            &conn,
+            "t3_fresh",
+            "provider",
+            "model",
+            "prompt-v2",
+            "raw",
+            &test_output(RecommendedAction::ReadingQueue, "fresh"),
+        )
+        .expect("fresh enrichment should insert");
+        // A successful run for t3_oldprompt, but under the older prompt-v1.
+        record_enrichment_success(
+            &conn,
+            "t3_oldprompt",
+            "provider",
+            "model",
+            "prompt-v1",
+            "raw",
+            &test_output(RecommendedAction::ReadingQueue, "old prompt"),
+        )
+        .expect("old-prompt enrichment should insert");
+        // t3_never has no enrichment row at all.
+
+        // Under prompt-v2 with no staleness window, only the post enriched under
+        // the current prompt is skipped; the old-prompt and never-enriched posts
+        // are selected.
+        let candidates = list_enrichment_candidates(&conn, 10, "prompt-v2", None)
+            .expect("candidates should query");
+        let names: std::collections::HashSet<_> = candidates
+            .iter()
+            .map(|p| p.reddit_fullname.clone())
+            .collect();
+        assert!(
+            !names.contains("t3_fresh"),
+            "current prompt should be skipped"
+        );
+        assert!(
+            names.contains("t3_oldprompt"),
+            "prompt change should re-select"
+        );
+        assert!(
+            names.contains("t3_never"),
+            "never-enriched should be selected"
+        );
+
+        // Re-running with the same prompt must not reselect a just-enriched post:
+        // selection is idempotent/resumable.
+        record_enrichment_success(
+            &conn,
+            "t3_never",
+            "provider",
+            "model",
+            "prompt-v2",
+            "raw",
+            &test_output(RecommendedAction::ReadingQueue, "now enriched"),
+        )
+        .expect("enrichment should insert");
+        let after = list_enrichment_candidates(&conn, 10, "prompt-v2", None)
+            .expect("candidates should query");
+        let after_names: std::collections::HashSet<_> =
+            after.iter().map(|p| p.reddit_fullname.clone()).collect();
+        assert!(
+            !after_names.contains("t3_never"),
+            "freshly enriched post must not reselect"
+        );
+
+        // A zero staleness window treats every existing run as stale, so even the
+        // current-prompt post becomes a candidate again.
+        let stale = list_enrichment_candidates(&conn, 10, "prompt-v2", Some(Duration::ZERO))
+            .expect("candidates should query");
+        let stale_names: std::collections::HashSet<_> =
+            stale.iter().map(|p| p.reddit_fullname.clone()).collect();
+        assert!(
+            stale_names.contains("t3_fresh"),
+            "zero window makes current runs stale"
+        );
+    }
+
+    #[test]
     fn zero_limits_return_no_enrichment_or_triage_rows() {
         let conn = test_db();
         let post = test_post();
         upsert_post(&conn, &post).expect("post should insert");
 
-        let candidates = list_enrichment_candidates(&conn, 0).expect("candidates should query");
+        let candidates = list_enrichment_candidates(&conn, 0, "prompt-v1", None)
+            .expect("candidates should query");
         assert!(candidates.is_empty());
 
         let items = list_triage_items(&conn, TriageView::All, 0, 0).expect("triage should query");
