@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
-use rusty_rss_mcp::config::{ensure_db_exists, parse_db_path};
+use rusty_rss_mcp::config::{DbPathArgs, USAGE, ensure_db_exists, parse_db_path};
 use rusty_rss_mcp::server::RustyRssServer;
 use tracing_subscriber::EnvFilter;
 
@@ -11,7 +11,15 @@ use tracing_subscriber::EnvFilter;
 async fn main() -> Result<()> {
     init_tracing();
 
-    let db_path = parse_db_path(std::env::args().skip(1))?;
+    let db_path = match parse_db_path(std::env::args().skip(1))? {
+        DbPathArgs::HelpRequested => {
+            // Diagnostics go to stderr; stdout is reserved for JSON-RPC. A help
+            // request is a successful, expected invocation, so exit 0.
+            eprintln!("{USAGE}");
+            return Ok(());
+        }
+        DbPathArgs::Resolved(path) => path,
+    };
     // Fail fast before binding stdio so a misconfigured path is reported on
     // stderr rather than surfacing as confusing per-call tool errors.
     ensure_db_exists(&db_path)?;

@@ -305,19 +305,107 @@ async fn invalid_arguments_are_rejected() {
         "search schema must require query: {required:?}"
     );
 
-    // An unknown triage view is rejected by our explicit validation, which
-    // returns ErrorData and therefore surfaces as a JSON-RPC protocol error.
+    // An unknown triage view is now rejected during rmcp argument
+    // deserialization against the published `view` enum schema, so it surfaces
+    // as a tool-level error result (is_error = true) rather than a JSON-RPC
+    // protocol error.
     let bad_view = client
         .call_tool(
             CallToolRequestParams::new("triage")
                 .with_arguments(args(json!({ "view": "not-a-view" }))),
         )
         .await
-        .expect_err("bad view should error");
-    assert!(
-        matches!(bad_view, ServiceError::McpError(_)),
-        "got {bad_view:?}"
-    );
+        .expect("call resolves");
+    assert_eq!(bad_view.is_error, Some(true), "got {bad_view:?}");
+
+    // The published triage schema must advertise the allowed views as an enum
+    // rather than an opaque string, and must accept both kebab- and
+    // snake-cased aliases for the same view.
+    let tools = client.list_all_tools().await.expect("list tools");
+    let triage = tools.iter().find(|t| t.name == "triage").unwrap();
+    let view_schema = triage
+        .input_schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .and_then(|props| props.get("view"))
+        .expect("view property in triage schema");
+    let schema_text = view_schema.to_string();
+    for expected in [
+        "high-value",
+        "should-build",
+        "reading-queue",
+        "reference-only",
+    ] {
+        assert!(
+            schema_text.contains(expected),
+            "triage view schema must list {expected}: {schema_text}"
+        );
+    }
+
+    // The snake_case alias resolves to the same view as its kebab-case form.
+    let alias = client
+        .call_tool(
+            CallToolRequestParams::new("triage")
+                .with_arguments(args(json!({ "view": "high_value" }))),
+        )
+        .await
+        .expect("alias view resolves");
+    assert_ne!(alias.is_error, Some(true), "got {alias:?}");
+    assert!(first_text(&alias).contains("t3_enriched"), "got {alias:?}");
+
+    client.cancel().await.ok();
+}
+
+#[tokio::test]
+async fn explicit_zero_limit_is_rejected() {
+    let client = connect(fixture_db()).await;
+
+    // An explicit limit of 0 contradicts the documented 1-100 range and would
+    // otherwise return an empty page indistinguishable from "no matches". It is
+    // rejected with invalid_params before the DB call, consistently across
+    // search, list, and triage.
+    for (tool, extra) in [
+        ("search", json!({ "query": "sqlite", "limit": 0 })),
+        ("list", json!({ "limit": 0 })),
+        ("triage", json!({ "view": "all", "limit": 0 })),
+    ] {
+        let err = client
+            .call_tool(CallToolRequestParams::new(tool).with_arguments(args(extra)))
+            .await
+            .expect_err("zero limit should be a protocol error");
+        assert!(
+            matches!(err, ServiceError::McpError(_)),
+            "{tool}: got {err:?}"
+        );
+    }
+
+    client.cancel().await.ok();
+}
+
+#[tokio::test]
+async fn limit_schema_advertises_one_to_hundred_range() {
+    let client = connect(fixture_db()).await;
+
+    let tools = client.list_all_tools().await.expect("list tools");
+    for tool_name in ["search", "list", "triage"] {
+        let tool = tools.iter().find(|t| t.name == tool_name).unwrap();
+        let limit = tool
+            .input_schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .and_then(|props| props.get("limit"))
+            .unwrap_or_else(|| panic!("{tool_name} must declare a limit property"));
+        let limit_text = limit.to_string();
+        // schemars 1.x emits `minimum`/`maximum` for `range(min, max)`.
+        assert!(
+            limit_text.contains("minimum") && limit_text.contains('1'),
+            "{tool_name} limit schema must carry minimum=1: {limit_text}"
+        );
+        assert!(
+            limit_text.contains("maximum") && limit_text.contains("100"),
+            "{tool_name} limit schema must carry maximum=100: {limit_text}"
+        );
+    }
 
     client.cancel().await.ok();
 }

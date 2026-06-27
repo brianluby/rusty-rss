@@ -13,9 +13,30 @@ use std::time::Duration;
 /// Default database path when neither flag nor env var is provided.
 const DEFAULT_DB_PATH: &str = "./rusty-rss.sqlite3";
 
+/// Usage banner printed for `--help`/`-h`. Callers must emit this to STDERR
+/// (stdout is reserved for the JSON-RPC channel).
+pub const USAGE: &str = "Usage: rusty-rss-mcp [--db-path PATH]";
+
+/// Outcome of parsing the CLI arguments.
+///
+/// Distinguishing `HelpRequested` from a resolved path keeps [`parse_db_path`]
+/// free of side effects (no printing, no `process::exit`), so it stays a pure,
+/// testable library function. The binary entrypoint is responsible for printing
+/// the [`USAGE`] banner and exiting on `HelpRequested`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DbPathArgs {
+    /// A database path was resolved from a flag, env var, or the default.
+    Resolved(PathBuf),
+    /// `--help`/`-h` was passed; the caller should print usage and exit 0.
+    HelpRequested,
+}
+
 /// Resolve the database path from CLI args (`--db-path`/`-d`) falling back to the
 /// `RUSTY_RSS_DB_PATH` environment variable and finally the default location.
-pub fn parse_db_path<I>(args: I) -> Result<PathBuf>
+///
+/// This function has no side effects: `--help`/`-h` returns
+/// [`DbPathArgs::HelpRequested`] rather than printing or exiting.
+pub fn parse_db_path<I>(args: I) -> Result<DbPathArgs>
 where
     I: IntoIterator<Item = String>,
 {
@@ -32,16 +53,12 @@ where
                     .ok_or_else(|| anyhow!("{arg} requires a database path"))?;
                 db_path = PathBuf::from(value);
             }
-            "--help" | "-h" => {
-                // Diagnostics go to stderr; stdout is reserved for JSON-RPC.
-                eprintln!("Usage: rusty-rss-mcp [--db-path PATH]");
-                std::process::exit(0);
-            }
+            "--help" | "-h" => return Ok(DbPathArgs::HelpRequested),
             other => return Err(anyhow!("unknown argument: {other}")),
         }
     }
 
-    Ok(db_path)
+    Ok(DbPathArgs::Resolved(db_path))
 }
 
 /// Fail fast when the database is missing instead of silently serving a freshly
@@ -101,14 +118,34 @@ mod tests {
 
     #[test]
     fn parse_db_path_reads_long_flag() {
-        let path = parse_db_path(args(&["--db-path", "/tmp/archive.sqlite3"])).unwrap();
-        assert_eq!(path, PathBuf::from("/tmp/archive.sqlite3"));
+        let parsed = parse_db_path(args(&["--db-path", "/tmp/archive.sqlite3"])).unwrap();
+        assert_eq!(
+            parsed,
+            DbPathArgs::Resolved(PathBuf::from("/tmp/archive.sqlite3"))
+        );
     }
 
     #[test]
     fn parse_db_path_reads_short_flag() {
-        let path = parse_db_path(args(&["-d", "/tmp/short.sqlite3"])).unwrap();
-        assert_eq!(path, PathBuf::from("/tmp/short.sqlite3"));
+        let parsed = parse_db_path(args(&["-d", "/tmp/short.sqlite3"])).unwrap();
+        assert_eq!(
+            parsed,
+            DbPathArgs::Resolved(PathBuf::from("/tmp/short.sqlite3"))
+        );
+    }
+
+    #[test]
+    fn parse_db_path_help_is_side_effect_free() {
+        // `--help`/`-h` must be reported as a request, never printed or exited
+        // from inside this library function.
+        assert_eq!(
+            parse_db_path(args(&["--help"])).unwrap(),
+            DbPathArgs::HelpRequested
+        );
+        assert_eq!(
+            parse_db_path(args(&["-h"])).unwrap(),
+            DbPathArgs::HelpRequested
+        );
     }
 
     #[test]

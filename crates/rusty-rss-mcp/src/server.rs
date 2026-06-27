@@ -32,8 +32,62 @@ const MAX_LIMIT: usize = 100;
 /// Default page size when a caller omits `limit`.
 const DEFAULT_LIMIT: usize = 20;
 
-fn clamp_limit(limit: Option<usize>) -> usize {
-    limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT)
+/// Resolve a caller-supplied `limit` into a concrete page size.
+///
+/// - `None` falls back to [`DEFAULT_LIMIT`].
+/// - `Some(0)` is rejected with an `invalid_params` error: a zero limit
+///   contradicts the documented `1-100` range and would otherwise return an
+///   empty page that is indistinguishable from "no matches".
+/// - `Some(n)` is clamped to [`MAX_LIMIT`].
+fn resolve_limit(limit: Option<usize>) -> Result<usize, ErrorData> {
+    match limit {
+        None => Ok(DEFAULT_LIMIT),
+        Some(0) => Err(ErrorData::invalid_params(
+            format!("limit must be between 1 and {MAX_LIMIT}"),
+            None,
+        )),
+        Some(n) => Ok(n.min(MAX_LIMIT)),
+    }
+}
+
+/// Triage view selector mirrored from [`rusty_rss_core::db::TriageView`].
+///
+/// Declared as a dedicated enum (rather than a free-form `String`) so the
+/// published JSON Schema advertises the allowed views as an `enum`. The
+/// `serde(alias = ...)` forms preserve the underscore spellings that the core
+/// [`TriageView::parse`] accepts, so e.g. both `high-value` and `high_value`
+/// deserialize identically.
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum TriageViewParam {
+    All,
+    Unprocessed,
+    #[serde(alias = "high_value")]
+    HighValue,
+    #[serde(alias = "should_test")]
+    ShouldTest,
+    #[serde(alias = "should_build")]
+    ShouldBuild,
+    #[serde(alias = "reading_queue")]
+    ReadingQueue,
+    #[serde(alias = "reference_only", alias = "reference")]
+    ReferenceOnly,
+    Discard,
+}
+
+impl From<TriageViewParam> for TriageView {
+    fn from(value: TriageViewParam) -> Self {
+        match value {
+            TriageViewParam::All => TriageView::All,
+            TriageViewParam::Unprocessed => TriageView::Unprocessed,
+            TriageViewParam::HighValue => TriageView::HighValue,
+            TriageViewParam::ShouldTest => TriageView::ShouldTest,
+            TriageViewParam::ShouldBuild => TriageView::ShouldBuild,
+            TriageViewParam::ReadingQueue => TriageView::ReadingQueue,
+            TriageViewParam::ReferenceOnly => TriageView::ReferenceOnly,
+            TriageViewParam::Discard => TriageView::Discard,
+        }
+    }
 }
 
 /// Parameters for [`RustyRssServer::search`].
@@ -43,6 +97,7 @@ pub struct SearchParams {
     pub query: String,
     /// Maximum number of hits to return (1-100, default 20).
     #[serde(default)]
+    #[schemars(range(min = 1, max = 100))]
     pub limit: Option<usize>,
     /// Restrict results to a subreddit (without the `r/` prefix).
     #[serde(default)]
@@ -57,6 +112,7 @@ pub struct SearchParams {
 pub struct ListParams {
     /// Maximum number of posts to return (1-100, default 20).
     #[serde(default)]
+    #[schemars(range(min = 1, max = 100))]
     pub limit: Option<usize>,
     /// Number of posts to skip for pagination (default 0).
     #[serde(default)]
@@ -77,9 +133,10 @@ pub struct TriageParams {
     /// `should-test`, `should-build`, `reading-queue`, `reference-only`,
     /// `discard`. Defaults to `unprocessed`.
     #[serde(default)]
-    pub view: Option<String>,
+    pub view: Option<TriageViewParam>,
     /// Maximum number of items to return (1-100, default 20).
     #[serde(default)]
+    #[schemars(range(min = 1, max = 100))]
     pub limit: Option<usize>,
     /// Number of items to skip for pagination (default 0).
     #[serde(default)]
@@ -144,7 +201,7 @@ impl RustyRssServer {
                 None,
             ));
         }
-        let limit = clamp_limit(params.limit);
+        let limit = resolve_limit(params.limit)?;
         let filters = SearchFilters {
             subreddit: params.subreddit,
             author: params.author,
@@ -161,7 +218,7 @@ impl RustyRssServer {
         &self,
         Parameters(params): Parameters<ListParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let limit = clamp_limit(params.limit);
+        let limit = resolve_limit(params.limit)?;
         let offset = params.offset.unwrap_or(0);
         let posts = self
             .with_db(move |conn| db::list_posts(conn, limit, offset))
@@ -198,11 +255,14 @@ impl RustyRssServer {
         &self,
         Parameters(params): Parameters<TriageParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let view_name = params.view.unwrap_or_else(|| "unprocessed".to_string());
-        let view = TriageView::parse(&view_name).ok_or_else(|| {
-            ErrorData::invalid_params(format!("unknown triage view: {view_name}"), None)
-        })?;
-        let limit = clamp_limit(params.limit);
+        // Defaults to the unprocessed queue. An unrecognized view never reaches
+        // here: rmcp rejects it during argument deserialization against the
+        // published enum schema.
+        let view = params
+            .view
+            .map(TriageView::from)
+            .unwrap_or(TriageView::Unprocessed);
+        let limit = resolve_limit(params.limit)?;
         let offset = params.offset.unwrap_or(0);
         let items = self
             .with_db(move |conn| db::list_triage_items(conn, view, limit, offset))

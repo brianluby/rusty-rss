@@ -133,7 +133,7 @@ MCP `triage` arguments:
 | Search for saved posts | MCP `search` | `rusty-rss search --json` |
 | Read one saved post | MCP `show` | `rusty-rss show` |
 | Browse recent posts | MCP `list` | `rusty-rss list` |
-| Get enriched queue | MCP `triage` or `rusty-rss triage --json` | `rusty-rss export --format jsonl --action ...` |
+| Get enriched queue | MCP `triage` | `rusty-rss triage --json` |
 | Bulk handoff | `rusty-rss export --format jsonl` | none |
 
 ## Machine-Readable Manifest
