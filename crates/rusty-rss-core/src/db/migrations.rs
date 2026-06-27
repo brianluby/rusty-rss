@@ -61,6 +61,16 @@ pub(crate) fn run_migrations(conn: &mut Connection) -> Result<()> {
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .context("failed to read schema user_version")?;
 
+    // Fail closed when the database was written by a newer binary: an older
+    // binary applying its (older) schema assumptions to a newer database can
+    // silently corrupt data. Refuse to touch it.
+    if current > LATEST_VERSION {
+        anyhow::bail!(
+            "database schema version {current} is newer than supported version {LATEST_VERSION}; \
+             upgrade the application"
+        );
+    }
+
     for migration in MIGRATIONS.iter().filter(|m| m.version > current) {
         let tx = conn
             .transaction()
@@ -384,3 +394,40 @@ CREATE TRIGGER IF NOT EXISTS enrichment_runs_au AFTER UPDATE ON enrichment_runs 
     VALUES (new.rowid, new.classification, new.tags_json, new.summary, new.rationale);
 END;
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_migrations_initializes_to_latest_version() {
+        let mut conn = Connection::open_in_memory().expect("in-memory db");
+        run_migrations(&mut conn).expect("migrations should apply");
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("read user_version");
+        assert_eq!(version, LATEST_VERSION);
+    }
+
+    #[test]
+    fn run_migrations_fails_closed_on_newer_schema_version() {
+        let mut conn = Connection::open_in_memory().expect("in-memory db");
+        run_migrations(&mut conn).expect("initial migrations should apply");
+
+        // Simulate a database written by a newer binary.
+        conn.execute_batch(&format!("PRAGMA user_version = {};", LATEST_VERSION + 1))
+            .expect("bump user_version");
+
+        let err = run_migrations(&mut conn).expect_err("a newer schema version must be rejected");
+        let message = err.to_string();
+        assert!(
+            message.contains(&(LATEST_VERSION + 1).to_string()),
+            "error should mention the offending version: {message}"
+        );
+        assert!(
+            message.contains("newer than supported"),
+            "error should explain the failure: {message}"
+        );
+    }
+}

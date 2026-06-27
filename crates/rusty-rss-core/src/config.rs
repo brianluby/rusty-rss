@@ -50,22 +50,33 @@ impl Config {
     }
 }
 
-/// Reduce a feed URL to `scheme://host[:port]/path`, stripping the query string
-/// (where Reddit carries the `feed` token and `user`) and any fragment.
+/// Clear every secret-bearing component of a parsed URL in place: userinfo
+/// (`user:pass@`), query string, and fragment. Leaves only
+/// `scheme://host[:port]/path`.
+fn clear_sensitive_url_parts(parsed: &mut url::Url) {
+    // `set_username`/`set_password` return Err for URLs that cannot have
+    // userinfo (e.g. `file:`); ignore that since there is nothing to clear.
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+}
+
+/// Reduce a feed URL to `scheme://host[:port]/path`, stripping userinfo
+/// (`user:pass@`), the query string (where Reddit carries the `feed` token and
+/// `user`), and any fragment.
 ///
 /// This is the only form that should ever be persisted to `sync_runs.source_url`
-/// or shown to an operator/agent. Scope is limited to the query string and
-/// fragment: if the URL cannot be parsed, the portion from the first `?` onward
-/// is still discarded. A secret embedded in the URL *path* (rather than the
-/// query) is NOT removed.
+/// or shown to an operator/agent. If the URL cannot be parsed, the portion from
+/// the first `?` or `#` onward is still discarded. A secret embedded in the URL
+/// *path* (rather than userinfo or query) is NOT removed.
 pub fn redact_feed_url(url: &str) -> String {
     match url::Url::parse(url) {
         Ok(mut parsed) => {
-            parsed.set_query(None);
-            parsed.set_fragment(None);
+            clear_sensitive_url_parts(&mut parsed);
             parsed.to_string()
         }
-        Err(_) => match url.split_once('?') {
+        Err(_) => match url.split_once(['?', '#']) {
             Some((head, _)) => head.to_string(),
             None => url.to_string(),
         },
@@ -74,10 +85,11 @@ pub fn redact_feed_url(url: &str) -> String {
 
 /// Scrub a diagnostic/error message so it cannot leak the feed token or user.
 ///
-/// Fetch failures from reqwest embed the full request URL (including the Reddit
-/// `feed` token and `user`), so both the persisted `sync_runs.error` and the
-/// error returned to callers/agents must be redacted. Two passes, fail-closed:
-/// (1) strip the query string from any URL in the text, then (2) belt-and-braces
+/// Fetch failures from reqwest embed the full request URL (including any
+/// `user:pass@` userinfo plus the Reddit `feed` token and `user` query params),
+/// so both the persisted `sync_runs.error` and the error returned to
+/// callers/agents must be redacted. Two passes, fail-closed: (1) strip userinfo,
+/// query, and fragment from any URL in the text, then (2) belt-and-braces
 /// replace each query-parameter value carried by the configured feed URL.
 pub fn redact_error(message: &str, feed_url: &str) -> String {
     let mut redacted = strip_url_queries(message);
@@ -100,7 +112,8 @@ fn sensitive_values(feed_url: &str) -> Vec<String> {
     }
 }
 
-/// Truncate every `http(s)://…` URL in `message` at its query/fragment.
+/// Strip userinfo, query, and fragment from every `http(s)://…` URL in
+/// `message`, leaving only `scheme://host[:port]/path`.
 fn strip_url_queries(message: &str) -> String {
     let mut out = String::with_capacity(message.len());
     let mut rest = message;
@@ -121,8 +134,18 @@ fn strip_url_queries(message: &str) -> String {
             .unwrap_or(from_url.len());
 
         let url = &from_url[..end];
-        let trimmed = url.split_once(['?', '#']).map_or(url, |(head, _)| head);
-        out.push_str(trimmed);
+        // Parse to drop userinfo as well as query/fragment; fall back to a plain
+        // `?`/`#` truncation when the substring is not a parseable URL.
+        let cleaned = match url::Url::parse(url) {
+            Ok(mut parsed) => {
+                clear_sensitive_url_parts(&mut parsed);
+                parsed.to_string()
+            }
+            Err(_) => url
+                .split_once(['?', '#'])
+                .map_or_else(|| url.to_string(), |(head, _)| head.to_string()),
+        };
+        out.push_str(&cleaned);
         rest = &from_url[end..];
     }
 
@@ -164,6 +187,42 @@ mod tests {
         let redacted = redact_feed_url("not a url?feed=SECRETTOKEN&user=SECRETUSER");
         assert!(!redacted.contains("SECRETTOKEN"));
         assert!(!redacted.contains("SECRETUSER"));
+    }
+
+    #[test]
+    fn redact_feed_url_strips_userinfo_and_query() {
+        let redacted = redact_feed_url("https://user:pass@example.com/feed?feed=TOKEN&user=USER");
+        assert_eq!(redacted, "https://example.com/feed");
+        assert!(!redacted.contains("user:pass"));
+        assert!(!redacted.contains("TOKEN"));
+    }
+
+    #[test]
+    fn redact_feed_url_unparseable_fallback_drops_fragment() {
+        let redacted = redact_feed_url("not a url#SECRETFRAG");
+        assert!(
+            !redacted.contains("SECRETFRAG"),
+            "fragment leaked: {redacted}"
+        );
+        assert_eq!(redacted, "not a url");
+    }
+
+    #[test]
+    fn redact_error_strips_userinfo_from_embedded_url() {
+        let feed_url = "https://user:pass@host/p?feed=SECRETTOKEN";
+        let message = "error sending request for url \
+            (https://user:pass@host/p?feed=SECRETTOKEN): connection refused";
+
+        let redacted = redact_error(message, feed_url);
+
+        assert!(
+            !redacted.contains("user:pass"),
+            "userinfo leaked: {redacted}"
+        );
+        assert!(
+            !redacted.contains("SECRETTOKEN"),
+            "token leaked: {redacted}"
+        );
     }
 
     #[test]

@@ -20,7 +20,11 @@ pub async fn fetch_feed(client: &Client, url: &str) -> Result<String> {
                 // redacts again before persisting/returning it.
                 let redacted = redact_error(&e.to_string(), url);
                 tracing::warn!(attempt, error = %redacted, "fetch failed, retrying");
-                last_err = Some(e);
+                // Store the sanitized error, not the raw reqwest error: its
+                // Display can embed the tokenized URL, and this is what callers
+                // receive after retries are exhausted. Fail closed at our own
+                // boundary.
+                last_err = Some(anyhow!(redacted));
                 if attempt < MAX_RETRIES {
                     tokio::time::sleep(Duration::from_secs(2u64.saturating_pow(attempt - 1))).await;
                 }
@@ -86,6 +90,16 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::mpsc;
+    use tokio::sync::Mutex;
+
+    /// Serializes the tests that drive `fetch_feed`'s retry `warn!` callsite.
+    ///
+    /// tracing caches callsite interest globally; a test that hits the callsite
+    /// with no thread-local subscriber installed can race-poison that cache to
+    /// "never", silently dropping warnings the capture test asserts on. Holding
+    /// this lock keeps those tests from overlapping. Async-aware so the guard can
+    /// be held across the `fetch_feed` await without tripping `await_holding_lock`.
+    static RETRY_WARN_TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
     fn serve_once(
         status: &str,
@@ -202,6 +216,7 @@ mod tests {
         // then closes, so the remaining retries fail with reqwest network errors
         // whose Display embeds the full tokenized URL. Both paths must be scrubbed
         // before they reach the tracing sink.
+        let _serialized = RETRY_WARN_TEST_LOCK.lock().await;
         let (base, _requests) = serve_once("503 Service Unavailable", "application/atom+xml", "no");
         let url = format!("{base}?feed=SECRETTOKEN&user=SECRETUSER");
         let client = build_http_client("rusty-rss-test/1.0");
@@ -237,6 +252,56 @@ mod tests {
         assert!(
             !captured.contains("SECRETUSER"),
             "feed user leaked into tracing output: {captured}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_feed_returned_error_never_leaks_token_on_network_failure() {
+        // Bind then immediately drop the listener so the port is closed: every
+        // connection attempt fails with a reqwest network error whose Display
+        // embeds the full tokenized URL. The error RETURNED to the caller after
+        // retries are exhausted must be sanitized.
+        let _serialized = RETRY_WARN_TEST_LOCK.lock().await;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("server should bind");
+        let addr = listener.local_addr().expect("local address should exist");
+        drop(listener);
+        let url = format!("http://{addr}/feed?feed=SECRETTOKEN&user=SECRETUSER");
+        let client = build_http_client("rusty-rss-test/1.0");
+
+        // Install a WARN subscriber for the duration so this test exercises the
+        // retry `warn!` callsite with a live subscriber, keeping the shared
+        // tracing interest cache from being poisoned to "never".
+        let logs = CapturingWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::WARN)
+            .without_time()
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let err = fetch_feed(&client, &url)
+            .await
+            .expect_err("connection to a closed port should fail");
+        drop(guard);
+
+        // The captured warnings are redacted too (belt-and-braces on the log path).
+        let captured = logs.contents();
+        assert!(
+            !captured.contains("SECRETTOKEN"),
+            "token leaked into logs: {captured}"
+        );
+        assert!(
+            !captured.contains("SECRETUSER"),
+            "user leaked into logs: {captured}"
+        );
+
+        let rendered = format!("{err:#}");
+        assert!(
+            !rendered.contains("SECRETTOKEN"),
+            "token leaked into returned error: {rendered}"
+        );
+        assert!(
+            !rendered.contains("SECRETUSER"),
+            "user leaked into returned error: {rendered}"
         );
     }
 
