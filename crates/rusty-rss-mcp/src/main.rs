@@ -14,9 +14,11 @@ fn main() -> Result<()> {
 /// Fail fast when the database is missing instead of silently serving a freshly
 /// created, empty archive because `--db-path` / `RUSTY_RSS_DB_PATH` is wrong.
 fn ensure_db_exists(db_path: &Path) -> Result<()> {
-    if !db_path.exists() {
+    // Require an existing file specifically: a missing path or a directory both
+    // produce a clear error here instead of a cryptic SQLite open failure later.
+    if !db_path.is_file() {
         return Err(anyhow!(
-            "database not found at {}; run `rusty-rss sync` first or pass a correct --db-path",
+            "database file not found at {}; run `rusty-rss sync` first or pass a correct --db-path",
             db_path.display()
         ));
     }
@@ -214,11 +216,12 @@ fn call_tool(db_path: &Path, params: &Value) -> std::result::Result<Value, (i64,
         }
         "show_post" => {
             let args: ShowArgs = serde_json::from_value(args).map_err(invalid_params)?;
-            db::get_post(&conn, &args.fullname)
-                .map_err(internal_error)?
-                .map_or(Value::Null, |post| {
-                    serde_json::to_value(post).unwrap_or(Value::Null)
-                })
+            // Propagate a serialization failure as an internal error instead of
+            // collapsing it to null, which is indistinguishable from "not found".
+            match db::get_post(&conn, &args.fullname).map_err(internal_error)? {
+                Some(post) => serde_json::to_value(post).map_err(internal_error)?,
+                None => Value::Null,
+            }
         }
         _ => return Err((-32602, format!("unknown tool: {name}"))),
     };
@@ -364,7 +367,15 @@ mod tests {
         let _ = std::fs::remove_file(&missing);
 
         let err = ensure_db_exists(&missing).expect_err("missing db should error");
-        assert!(err.to_string().contains("database not found"), "got: {err}");
+        assert!(
+            err.to_string().contains("database file not found"),
+            "got: {err}"
+        );
+
+        // A directory at the path is also rejected (not a usable database file).
+        let dir = std::env::temp_dir();
+        let dir_err = ensure_db_exists(&dir).expect_err("a directory should error");
+        assert!(dir_err.to_string().contains("database file not found"));
     }
 
     #[test]
