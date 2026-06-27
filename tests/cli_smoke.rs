@@ -383,7 +383,10 @@ fn binary_tag_missing_rules_file_errors() {
 fn binary_fts_subcommand_is_hidden_but_runs() {
     let db_path = test_db_path();
 
-    // The `fts` maintenance command is hidden: it must not appear in top-level help.
+    // The `fts` maintenance command is hidden: it must not be listed as a
+    // subcommand in top-level help. Check the command listing specifically (a line
+    // whose first token is `fts`) rather than a bare substring, so unrelated help
+    // text mentioning "fts" can't make this pass or fail spuriously.
     let help = Command::new(binary())
         .arg("--help")
         .output()
@@ -391,8 +394,20 @@ fn binary_fts_subcommand_is_hidden_but_runs() {
     assert!(help.status.success());
     let help_stdout = String::from_utf8_lossy(&help.stdout);
     assert!(
-        !help_stdout.contains("fts"),
-        "hidden fts command should not appear in help: {help_stdout}"
+        !help_stdout
+            .lines()
+            .any(|line| line.split_whitespace().next() == Some("fts")),
+        "hidden fts command should not be listed in help: {help_stdout}"
+    );
+
+    // Hidden commands are still invocable: `fts --help` resolves the subcommand.
+    let fts_help = Command::new(binary())
+        .args(["fts", "--help"])
+        .output()
+        .expect("binary should run");
+    assert!(
+        fts_help.status.success(),
+        "hidden fts command should still be invocable"
     );
 
     // The nested `fts check` subcommand still works and reports OK on a fresh db.

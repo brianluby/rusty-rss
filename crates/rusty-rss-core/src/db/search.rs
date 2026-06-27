@@ -531,6 +531,34 @@ mod tests {
         fts_integrity_check(&conn).expect("integrity check should pass after rebuild");
     }
 
+    #[test]
+    fn is_fts_corruption_classifies_only_corruption_errors() {
+        // The corruption-mapping arm of fts_integrity_check is the function's
+        // reason to exist; driving real index corruption is SQLite-version
+        // dependent, so verify the classifier directly and deterministically.
+        // SQLITE_CORRUPT_VTAB is the extended code FTS5 raises; rusqlite reports
+        // its primary code as DatabaseCorrupt.
+        let corrupt = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT_VTAB),
+            Some("fts5: corruption detected".to_string()),
+        );
+        assert!(
+            is_fts_corruption(&corrupt),
+            "SQLITE_CORRUPT_VTAB is corruption"
+        );
+
+        let busy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            None,
+        );
+        assert!(!is_fts_corruption(&busy), "SQLITE_BUSY is not corruption");
+
+        assert!(
+            !is_fts_corruption(&rusqlite::Error::QueryReturnedNoRows),
+            "non-SqliteFailure errors are not corruption"
+        );
+    }
+
     /// Build a successful capture upsert whose searchable text lives in
     /// `description`, so a term unique to the capture exercises `capture_fts`.
     fn capture_with(reddit_fullname: &str, description: &str) -> OutboundCaptureUpsert {

@@ -205,6 +205,38 @@ mod tests {
         assert_eq!(PROMPT_VERSION, "enrich-v2");
     }
 
+    /// The exact rubric line prefix the system prompt must contain for each
+    /// `Classification`. The exhaustive `match` is the drift guard: adding a
+    /// variant fails to compile here until its rubric token is declared, which
+    /// forces the corresponding SYSTEM_PROMPT line (asserted below) to exist. The
+    /// `- {value}:` form is specific, so `reference` can't pass via
+    /// `reference_only`.
+    fn classification_rubric_line(c: Classification) -> &'static str {
+        match c {
+            Classification::Article => "- article:",
+            Classification::Tool => "- tool:",
+            Classification::Tutorial => "- tutorial:",
+            Classification::Reference => "- reference:",
+            Classification::Discussion => "- discussion:",
+            Classification::Question => "- question:",
+            Classification::News => "- news:",
+            Classification::Other => "- other:",
+        }
+    }
+
+    /// The exact rubric line prefix for each `RecommendedAction`; same exhaustive
+    /// drift guard as [`classification_rubric_line`].
+    fn action_rubric_line(a: RecommendedAction) -> &'static str {
+        match a {
+            RecommendedAction::ShouldTest => "- should_test:",
+            RecommendedAction::ShouldBuild => "- should_build:",
+            RecommendedAction::ReadingQueue => "- reading_queue:",
+            RecommendedAction::ReferenceOnly => "- reference_only:",
+            RecommendedAction::Discard => "- discard:",
+            RecommendedAction::Other => "- other:",
+        }
+    }
+
     #[test]
     fn system_prompt_documents_every_enum_variant() {
         let messages = build_enrichment_messages(&normal_post(), MAX_CONTENT_CHARS);
@@ -220,10 +252,10 @@ mod tests {
             Classification::News,
             Classification::Other,
         ] {
+            let token = classification_rubric_line(classification);
             assert!(
-                system.contains(classification.as_str()),
-                "rubric is missing classification `{}`",
-                classification.as_str()
+                system.contains(token),
+                "rubric is missing classification `{token}`"
             );
         }
 
@@ -235,10 +267,10 @@ mod tests {
             RecommendedAction::Discard,
             RecommendedAction::Other,
         ] {
+            let token = action_rubric_line(action);
             assert!(
-                system.contains(action.as_str()),
-                "rubric is missing recommended_action `{}`",
-                action.as_str()
+                system.contains(token),
+                "rubric is missing recommended_action `{token}`"
             );
         }
 
