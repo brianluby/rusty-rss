@@ -8,6 +8,13 @@ pub fn init_db(db_path: &Path) -> Result<Connection> {
     let conn = Connection::open(db_path)
         .context(format!("failed to open database at {}", db_path.display()))?;
 
+    // SQLite leaves foreign keys off by default and the setting is per
+    // connection, so enable it before any access for the schema's FK
+    // constraints (enrichment_runs / outbound_captures / post_tags ->
+    // saved_posts) to actually be enforced.
+    conn.execute_batch("PRAGMA foreign_keys = ON;")
+        .context("failed to enable foreign key enforcement")?;
+
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS saved_posts (
@@ -123,7 +130,7 @@ pub fn init_db(db_path: &Path) -> Result<Connection> {
     ensure_column(&conn, "outbound_captures", "content_hash", "TEXT")?;
     migrate_content_html_to_markdown(&conn)?;
     init_fts(&conn)?;
-    rebuild_empty_fts_index(&conn)?;
+    rebuild_stale_fts_index(&conn)?;
 
     Ok(conn)
 }
@@ -162,7 +169,7 @@ fn init_fts(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn rebuild_empty_fts_index(conn: &Connection) -> Result<()> {
+fn rebuild_stale_fts_index(conn: &Connection) -> Result<()> {
     let saved_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM saved_posts", [], |row| row.get(0))
         .context("failed to count saved posts for FTS rebuild")?;
@@ -175,7 +182,9 @@ fn rebuild_empty_fts_index(conn: &Connection) -> Result<()> {
             row.get(0)
         })
         .context("failed to count indexed FTS documents")?;
-    if indexed_count == 0 {
+    // Rebuild whenever the index is out of sync with the table, not only when it
+    // is completely empty, so a partially populated or stale index is repaired.
+    if indexed_count != saved_count {
         conn.execute("INSERT INTO posts_fts(posts_fts) VALUES ('rebuild')", [])
             .context("failed to rebuild full-text search index")?;
     }
@@ -343,5 +352,57 @@ mod tests {
             .expect("migrated markdown should search");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].reddit_fullname, "t3_old");
+    }
+
+    #[test]
+    fn init_db_enables_foreign_key_enforcement() {
+        let conn = init_db(&unique_db_path("fk")).expect("init should succeed");
+
+        // No matching saved_posts row exists, so this child insert must be
+        // rejected by the FK constraint once enforcement is enabled.
+        let result = conn.execute(
+            "INSERT INTO enrichment_runs
+                 (reddit_fullname, provider, model, prompt_version, status, created_at)
+             VALUES ('t3_missing', 'p', 'm', 'v', 'error', '2026-01-01T00:00:00Z')",
+            [],
+        );
+
+        assert!(
+            result.is_err(),
+            "insert referencing a missing saved_post should violate the FK"
+        );
+    }
+
+    #[test]
+    fn init_db_rebuilds_partially_stale_fts_index() {
+        let path = unique_db_path("fts_partial");
+        let conn = init_db(&path).expect("init should succeed");
+        for (fullname, title) in [("t3_one", "Alpha unique"), ("t3_two", "Beta unique")] {
+            conn.execute(
+                "INSERT INTO saved_posts
+                     (reddit_fullname, reddit_id, title, permalink, first_seen_at, last_seen_at, source)
+                 VALUES (?, ?, ?, ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'atom')",
+                params![fullname, fullname, title, "https://example.com/"],
+            )
+            .expect("insert should succeed");
+        }
+
+        // Drop one document from the FTS index while leaving its table row in
+        // place, leaving the index partially populated (indexed < saved).
+        conn.execute(
+            "INSERT INTO posts_fts(posts_fts, rowid, title, content_markdown)
+             SELECT 'delete', rowid, title, content_markdown
+             FROM saved_posts WHERE reddit_fullname = 't3_two'",
+            [],
+        )
+        .expect("removing one FTS doc should succeed");
+        drop(conn);
+
+        // Re-init must detect the stale index and rebuild it, not skip it.
+        let conn = init_db(&path).expect("re-init should rebuild");
+        let hits = search_posts(&conn, "Beta", &SearchFilters::default(), 10)
+            .expect("rebuilt index should search");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].reddit_fullname, "t3_two");
     }
 }

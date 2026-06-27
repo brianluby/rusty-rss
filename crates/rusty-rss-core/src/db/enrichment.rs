@@ -194,7 +194,7 @@ pub fn list_triage_items(
              LIMIT 1
          )
          WHERE {where_clause}
-         ORDER BY p.last_seen_at DESC
+         ORDER BY p.last_seen_at DESC, p.reddit_fullname DESC
          LIMIT ? OFFSET ?"
     );
     let mut stmt = conn.prepare(&query)?;
@@ -210,21 +210,12 @@ fn enrichment_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Enric
     let status: String = row.get(5)?;
     let output = if status == "success" {
         Some(EnrichmentOutput {
-            classification: row
-                .get::<_, String>(7)?
-                .parse()
-                .unwrap_or(Classification::Other),
-            tags: row
-                .get::<_, Option<String>>(8)?
-                .and_then(|tags| serde_json::from_str(&tags).ok())
-                .unwrap_or_default(),
+            classification: parse_classification(row, 7)?,
+            tags: parse_tags(row, 8)?,
             summary: row.get(9)?,
             joy_value: row.get(10)?,
             work_value: row.get(11)?,
-            recommended_action: row
-                .get::<_, String>(12)?
-                .parse()
-                .unwrap_or(RecommendedAction::Other),
+            recommended_action: parse_recommended_action(row, 12)?,
             rationale: row.get(13)?,
             confidence: row.get(14)?,
         })
@@ -271,21 +262,12 @@ pub(super) fn enrichment_record_from_row_with_offset(
     let status: String = row.get(offset + 5)?;
     let output = if status == "success" {
         Some(EnrichmentOutput {
-            classification: row
-                .get::<_, String>(offset + 7)?
-                .parse()
-                .unwrap_or(Classification::Other),
-            tags: row
-                .get::<_, Option<String>>(offset + 8)?
-                .and_then(|tags| serde_json::from_str(&tags).ok())
-                .unwrap_or_default(),
+            classification: parse_classification(row, offset + 7)?,
+            tags: parse_tags(row, offset + 8)?,
             summary: row.get(offset + 9)?,
             joy_value: row.get(offset + 10)?,
             work_value: row.get(offset + 11)?,
-            recommended_action: row
-                .get::<_, String>(offset + 12)?
-                .parse()
-                .unwrap_or(RecommendedAction::Other),
+            recommended_action: parse_recommended_action(row, offset + 12)?,
             rationale: row.get(offset + 13)?,
             confidence: row.get(offset + 14)?,
         })
@@ -305,6 +287,40 @@ pub(super) fn enrichment_record_from_row_with_offset(
         error: row.get(offset + 15)?,
         created_at: row.get(offset + 16)?,
     })
+}
+
+/// Parse a stored classification, surfacing an unrecognized value as a
+/// row-conversion error rather than silently coercing it to a default.
+fn parse_classification(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<Classification> {
+    row.get::<_, String>(idx)?.parse().map_err(|err: String| {
+        rusqlite::Error::FromSqlConversionFailure(idx, rusqlite::types::Type::Text, err.into())
+    })
+}
+
+/// Parse a stored recommended action, surfacing an unrecognized value as a
+/// row-conversion error rather than silently coercing it to a default.
+fn parse_recommended_action(
+    row: &rusqlite::Row<'_>,
+    idx: usize,
+) -> rusqlite::Result<RecommendedAction> {
+    row.get::<_, String>(idx)?.parse().map_err(|err: String| {
+        rusqlite::Error::FromSqlConversionFailure(idx, rusqlite::types::Type::Text, err.into())
+    })
+}
+
+/// Parse the stored tags JSON array. A NULL column yields an empty list, but
+/// malformed JSON surfaces as a row-conversion error instead of being dropped.
+fn parse_tags(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<Vec<String>> {
+    match row.get::<_, Option<String>>(idx)? {
+        Some(tags) => serde_json::from_str(&tags).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                idx,
+                rusqlite::types::Type::Text,
+                Box::new(err),
+            )
+        }),
+        None => Ok(Vec::new()),
+    }
 }
 
 #[cfg(test)]
@@ -432,6 +448,36 @@ mod tests {
             latest_enrichment(&conn, "t3_test123")
                 .expect("latest should query")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn malformed_enrichment_row_surfaces_as_error() {
+        let conn = test_db();
+        let post = test_post();
+        upsert_post(&conn, &post).expect("post should insert");
+        record_enrichment_success(
+            &conn,
+            "t3_test123",
+            "provider",
+            "model",
+            "prompt",
+            "raw",
+            &test_output(RecommendedAction::ShouldBuild, "summary"),
+        )
+        .expect("enrichment should insert");
+
+        conn.execute(
+            "UPDATE enrichment_runs SET recommended_action = 'bogus_action' WHERE reddit_fullname = ?",
+            params!["t3_test123"],
+        )
+        .expect("corrupting the action should succeed");
+
+        let err =
+            latest_enrichment(&conn, "t3_test123").expect_err("malformed action row should fail");
+        assert!(
+            err.to_string()
+                .contains("failed to query latest enrichment")
         );
     }
 }
