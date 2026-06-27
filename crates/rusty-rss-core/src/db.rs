@@ -456,8 +456,8 @@ pub fn search_posts(
              FROM posts_fts
              JOIN saved_posts p ON p.rowid = posts_fts.rowid
              WHERE posts_fts MATCH ?
-               AND (? IS NULL OR p.subreddit = ?)
-               AND (? IS NULL OR p.author = ?)
+               AND (? IS NULL OR p.subreddit = ? COLLATE NOCASE)
+               AND (? IS NULL OR p.author = ? COLLATE NOCASE)
              ORDER BY rank ASC, p.last_seen_at DESC
              LIMIT ?",
         )
@@ -487,7 +487,9 @@ pub fn search_posts(
                 })
             },
         )
-        .map_err(|err| anyhow!("invalid search query: {err}"))?;
+        // The query syntax was already validated in normalize_fts_query, so an
+        // error here is a database failure, not bad user input.
+        .context("failed to execute search query")?;
 
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .context("failed to collect search results")
@@ -700,7 +702,11 @@ pub fn list_outbound_capture_candidates(
          FROM saved_posts p
          LEFT JOIN outbound_captures c ON c.reddit_fullname = p.reddit_fullname
          WHERE p.outbound_url IS NOT NULL
-           AND (c.reddit_fullname IS NULL OR c.status != 'success')
+           AND (
+               c.reddit_fullname IS NULL
+               OR c.status != 'success'
+               OR c.original_url != p.outbound_url
+           )
          ORDER BY p.last_seen_at DESC
          LIMIT ?",
     )?;
@@ -1656,6 +1662,29 @@ mod tests {
     }
 
     #[test]
+    fn search_filters_are_case_insensitive() {
+        let conn = test_db();
+        let mut post = test_post();
+        post.title = "Case target".to_string();
+        post.subreddit = Some("Rust".to_string());
+        post.author = Some("Alice".to_string());
+        upsert_post(&conn, &post).expect("post should insert");
+
+        let hits = search_posts(
+            &conn,
+            "target",
+            &SearchFilters {
+                subreddit: Some("rust".to_string()),
+                author: Some("alice".to_string()),
+            },
+            10,
+        )
+        .expect("filtered search should succeed");
+
+        assert_eq!(hits.len(), 1, "filters should match regardless of case");
+    }
+
+    #[test]
     fn export_records_include_latest_enrichment_and_capture() {
         let conn = test_db();
         let post = test_post();
@@ -1753,6 +1782,47 @@ mod tests {
 
         let candidates = list_outbound_capture_candidates(&conn, 10).expect("candidates query");
         assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn changed_outbound_url_reschedules_capture() {
+        let conn = test_db();
+        let mut post = test_post();
+        post.outbound_url = Some("https://example.com/old".to_string());
+        upsert_post(&conn, &post).expect("post should insert");
+        upsert_outbound_capture(
+            &conn,
+            &OutboundCaptureUpsert {
+                reddit_fullname: "t3_test123".to_string(),
+                original_url: "https://example.com/old".to_string(),
+                final_url: Some("https://example.com/old".to_string()),
+                canonical_url: None,
+                title: Some("Old".to_string()),
+                description: None,
+                site_name: None,
+                preview_image_url: None,
+                content_markdown: None,
+                content_hash: None,
+                status: "success".to_string(),
+                http_status: Some(200),
+                error: None,
+            },
+        )
+        .expect("capture should insert");
+        assert!(
+            list_outbound_capture_candidates(&conn, 10)
+                .expect("query")
+                .is_empty(),
+            "an unchanged URL with a success capture is not a candidate"
+        );
+
+        // The outbound URL changes, so the stale capture must be retried.
+        post.outbound_url = Some("https://example.com/new".to_string());
+        upsert_post(&conn, &post).expect("post should update");
+
+        let candidates = list_outbound_capture_candidates(&conn, 10).expect("query");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].outbound_url, "https://example.com/new");
     }
 
     #[test]

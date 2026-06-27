@@ -38,7 +38,7 @@ Capture is intentionally conservative:
 - `localhost`, private IP ranges, link-local hosts, documentation IPs, broadcast addresses, and unspecified addresses are blocked by default.
 - Responses must be HTML.
 - The response body is limited to 1 MiB.
-- Each request has a 20 second timeout.
+- Each request has a 20-second timeout.
 - The batch uses a default maximum concurrency of 4.
 - Transient failures are retried up to 3 attempts.
 

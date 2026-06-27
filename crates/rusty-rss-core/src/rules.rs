@@ -187,20 +187,20 @@ impl RuleSet {
     }
 
     fn validate(&self) -> Result<()> {
+        // All structural validation lives in compile(), so every entry point
+        // (from_toml and the CLI load() path) is checked identically.
+        self.compile()?;
+        Ok(())
+    }
+
+    /// Lower every topic to FTS5 operands, validating meta/signals/kinds/shapes.
+    pub fn compile(&self) -> Result<CompiledRuleSet> {
         if self.meta.version.trim().is_empty() {
             bail!("[meta].version must not be empty");
         }
         if self.topics.is_empty() {
             bail!("rules file defines no topics");
         }
-        // Compilation performs the per-rule validation; run it so parsing a
-        // structurally bad config fails fast even before the DB smoke test.
-        self.compile()?;
-        Ok(())
-    }
-
-    /// Lower every topic to FTS5 operands, validating signals/kinds/shapes.
-    pub fn compile(&self) -> Result<CompiledRuleSet> {
         let mut topics = Vec::with_capacity(self.topics.len());
         for (name, topic) in &self.topics {
             if !topic.threshold.is_finite() {
@@ -750,6 +750,20 @@ rules = [{ id = "r", signal = "any", kind = "terms", match = ["mem0", "memor*", 
                 "(\"knowledge graph\")".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn load_rejects_rules_file_with_no_topics() {
+        // A topic-less file must fail on the CLI load() path too, otherwise a
+        // full-archive `tag` run would delete every post_tags row and write none.
+        let path =
+            std::env::temp_dir().join(format!("rusty_rss_rules_empty_{}.toml", std::process::id()));
+        std::fs::write(&path, "[meta]\nversion = \"v\"\n").expect("write temp rules");
+
+        let err = RuleSet::load(&path).expect_err("empty-topics rules must be rejected");
+        assert!(format!("{err:#}").contains("defines no topics"));
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

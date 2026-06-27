@@ -12,9 +12,11 @@ rusty-rss tag --rules ./rules.toml
 ```
 
 This evaluates every topic in the rules file against the whole archive and
-writes one `post_tags` row per `(post, topic)` that scored. The run is
-**authoritative**: re-running after a rule change removes tags that no longer
-fire, so consumers always see current tags.
+writes one `post_tags` row per `(post, topic)` that scored. A full run (no
+`--limit`) is **authoritative**: re-running after a rule change removes tags that
+no longer fire, so consumers always see current tags. A `--limit` run only
+refreshes the processed slice — tags for posts outside that slice are left
+untouched.
 
 ```text
 Tagging complete: 867 posts, 6 topics, 142 rows written, 58 passed, 9 vetoed

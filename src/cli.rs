@@ -648,7 +648,7 @@ fn csv_escape(value: &str) -> String {
     let neutralized;
     let value = if matches!(
         value.as_bytes().first(),
-        Some(b'=' | b'+' | b'-' | b'@' | b'\t' | b'\r')
+        Some(b'=' | b'+' | b'-' | b'@' | b'\t' | b'\r' | b'\n')
     ) {
         neutralized = format!("'{value}");
         neutralized.as_str()
@@ -788,6 +788,8 @@ mod tests {
         // Formula-leading values are prefixed with a single quote.
         assert_eq!(csv_escape("=SUM(A1:A2)"), "'=SUM(A1:A2)");
         assert_eq!(csv_escape("@cmd"), "'@cmd");
+        // A leading newline must also be neutralized (some parsers trim it).
+        assert_eq!(csv_escape("\n=evil"), "\"'\n=evil\"");
         // Neutralized values that also need quoting still get quoted.
         assert_eq!(csv_escape("=1,2"), "\"'=1,2\"");
         // Ordinary values are untouched.
