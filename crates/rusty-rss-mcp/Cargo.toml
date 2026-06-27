@@ -6,6 +6,17 @@ rust-version = "1.88"
 
 [dependencies]
 anyhow = "1"
+rmcp = { version = "1.8.0", features = ["server", "transport-io", "macros", "schemars"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
 rusty-rss-core = { path = "../rusty-rss-core" }
+schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+rmcp = { version = "1.8.0", features = ["client"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util"] }
