@@ -143,6 +143,16 @@ pub fn init_db(db_path: &Path) -> Result<Connection> {
 }
 
 fn init_fts(conn: &Connection) -> Result<()> {
+    // Each FTS5 table is external-content (`content=`/`content_rowid='rowid'`):
+    // it stores only the inverted index and reads document text from its content
+    // table by rowid, kept in sync by AFTER INSERT/DELETE/UPDATE triggers that
+    // mirror `old.rowid`/`new.rowid`. The aux `capture_fts`/`enrichment_fts`
+    // tables (RSS-36) mirror the `posts_fts` pattern exactly so a future
+    // multi-source search can UNION all three; see `search::search_multi_source`
+    // and docs/explanation/fts-multi-source.md. NULL columns index as empty text,
+    // so posts without a capture or enrichment simply never appear in those
+    // indexes. The FTS column names must match real columns on the content table
+    // because the `'rebuild'` command re-reads them by name.
     conn.execute_batch(
         r#"
         CREATE VIRTUAL TABLE IF NOT EXISTS posts_fts USING fts5(
@@ -169,6 +179,60 @@ fn init_fts(conn: &Connection) -> Result<()> {
             INSERT INTO posts_fts(rowid, title, content_markdown)
             VALUES (new.rowid, new.title, new.content_markdown);
         END;
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS capture_fts USING fts5(
+            title,
+            description,
+            site_name,
+            content_markdown,
+            content='outbound_captures',
+            content_rowid='rowid',
+            tokenize='porter unicode61'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS outbound_captures_ai AFTER INSERT ON outbound_captures BEGIN
+            INSERT INTO capture_fts(rowid, title, description, site_name, content_markdown)
+            VALUES (new.rowid, new.title, new.description, new.site_name, new.content_markdown);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS outbound_captures_ad AFTER DELETE ON outbound_captures BEGIN
+            INSERT INTO capture_fts(capture_fts, rowid, title, description, site_name, content_markdown)
+            VALUES ('delete', old.rowid, old.title, old.description, old.site_name, old.content_markdown);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS outbound_captures_au AFTER UPDATE ON outbound_captures BEGIN
+            INSERT INTO capture_fts(capture_fts, rowid, title, description, site_name, content_markdown)
+            VALUES ('delete', old.rowid, old.title, old.description, old.site_name, old.content_markdown);
+            INSERT INTO capture_fts(rowid, title, description, site_name, content_markdown)
+            VALUES (new.rowid, new.title, new.description, new.site_name, new.content_markdown);
+        END;
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS enrichment_fts USING fts5(
+            classification,
+            tags_json,
+            summary,
+            rationale,
+            content='enrichment_runs',
+            content_rowid='rowid',
+            tokenize='porter unicode61'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS enrichment_runs_ai AFTER INSERT ON enrichment_runs BEGIN
+            INSERT INTO enrichment_fts(rowid, classification, tags_json, summary, rationale)
+            VALUES (new.rowid, new.classification, new.tags_json, new.summary, new.rationale);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS enrichment_runs_ad AFTER DELETE ON enrichment_runs BEGIN
+            INSERT INTO enrichment_fts(enrichment_fts, rowid, classification, tags_json, summary, rationale)
+            VALUES ('delete', old.rowid, old.classification, old.tags_json, old.summary, old.rationale);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS enrichment_runs_au AFTER UPDATE ON enrichment_runs BEGIN
+            INSERT INTO enrichment_fts(enrichment_fts, rowid, classification, tags_json, summary, rationale)
+            VALUES ('delete', old.rowid, old.classification, old.tags_json, old.summary, old.rationale);
+            INSERT INTO enrichment_fts(rowid, classification, tags_json, summary, rationale)
+            VALUES (new.rowid, new.classification, new.tags_json, new.summary, new.rationale);
+        END;
         "#,
     )
     .context("failed to initialize full-text search schema")?;
@@ -177,20 +241,45 @@ fn init_fts(conn: &Connection) -> Result<()> {
 }
 
 fn rebuild_stale_fts_index(conn: &Connection) -> Result<()> {
-    let saved_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM saved_posts", [], |row| row.get(0))
-        .context("failed to count saved posts for FTS rebuild")?;
+    // Backfill/repair each external-content index whenever it drifts from its
+    // content table (e.g. rows that predate the index, or a partially populated
+    // index), not only when it is empty.
+    rebuild_index_if_stale(conn, "saved_posts", "posts_fts")?;
+    rebuild_index_if_stale(conn, "outbound_captures", "capture_fts")?;
+    rebuild_index_if_stale(conn, "enrichment_runs", "enrichment_fts")?;
+
+    Ok(())
+}
+
+/// Rebuild `fts_table` from `content_table` when their row counts disagree.
+///
+/// Both names are compile-time constants from this module (never user input), so
+/// interpolating them into the SQL is safe. The `<fts>_docsize` shadow table is
+/// created automatically for every FTS5 table and holds one row per indexed
+/// document, so its count is the indexed-document count.
+fn rebuild_index_if_stale(conn: &Connection, content_table: &str, fts_table: &str) -> Result<()> {
+    let content_count: i64 = conn
+        .query_row(
+            &format!("SELECT COUNT(*) FROM {content_table}"),
+            [],
+            |row| row.get(0),
+        )
+        .context(format!("failed to count {content_table} for FTS rebuild"))?;
 
     let indexed_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM posts_fts_docsize", [], |row| {
-            row.get(0)
-        })
-        .context("failed to count indexed FTS documents")?;
-    // Rebuild whenever the index is out of sync with the table, not only when it
-    // is completely empty, so a partially populated or stale index is repaired.
-    if indexed_count != saved_count {
-        conn.execute("INSERT INTO posts_fts(posts_fts) VALUES ('rebuild')", [])
-            .context("failed to rebuild full-text search index")?;
+        .query_row(
+            &format!("SELECT COUNT(*) FROM {fts_table}_docsize"),
+            [],
+            |row| row.get(0),
+        )
+        .context(format!("failed to count indexed {fts_table} documents"))?;
+
+    if indexed_count != content_count {
+        conn.execute(
+            &format!("INSERT INTO {fts_table}({fts_table}) VALUES ('rebuild')"),
+            [],
+        )
+        .context(format!("failed to rebuild {fts_table} index"))?;
     }
 
     Ok(())
