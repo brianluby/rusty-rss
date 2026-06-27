@@ -1,12 +1,19 @@
-//! Database initialization, schema, FTS setup, and ad-hoc column migrations.
+//! Database initialization and full-text-search index repair.
+//!
+//! Schema creation and column/data migrations live in [`super::migrations`],
+//! which `init_db` drives through a `PRAGMA user_version`-gated, transactional
+//! runner. This module owns connection setup (busy timeout, foreign-key
+//! enforcement) and the per-init FTS drift repair that runs on every open.
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
 use std::path::Path;
 use std::time::Duration;
 
+use super::migrations;
+
 pub fn init_db(db_path: &Path) -> Result<Connection> {
-    let conn = Connection::open(db_path)
+    let mut conn = Connection::open(db_path)
         .context(format!("failed to open database at {}", db_path.display()))?;
 
     // Wait on a contended write lock instead of failing immediately with
@@ -18,226 +25,21 @@ pub fn init_db(db_path: &Path) -> Result<Connection> {
     // SQLite leaves foreign keys off by default and the setting is per
     // connection, so enable it before any access for the schema's FK
     // constraints (enrichment_runs / outbound_captures / post_tags ->
-    // saved_posts) to actually be enforced.
+    // saved_posts) to actually be enforced. This must precede the migration
+    // runner so foreign keys are enforced during migrations too.
     conn.execute_batch("PRAGMA foreign_keys = ON;")
         .context("failed to enable foreign key enforcement")?;
 
-    conn.execute_batch(
-        r#"
-        CREATE TABLE IF NOT EXISTS saved_posts (
-            reddit_fullname TEXT PRIMARY KEY,
-            reddit_id TEXT,
-            title TEXT NOT NULL,
-            author TEXT,
-            subreddit TEXT,
-            permalink TEXT NOT NULL,
-            outbound_url TEXT,
-            content_markdown TEXT,
-            thumbnail_url TEXT,
-            published_at TEXT,
-            updated_at TEXT,
-            first_seen_at TEXT NOT NULL,
-            last_seen_at TEXT NOT NULL,
-            source TEXT NOT NULL DEFAULT 'atom',
-            raw_entry TEXT
-        );
+    // Apply pending schema/data migrations (idempotent on an up-to-date DB).
+    migrations::run_migrations(&mut conn)?;
 
-        CREATE INDEX IF NOT EXISTS idx_saved_posts_subreddit ON saved_posts(subreddit);
-        CREATE INDEX IF NOT EXISTS idx_saved_posts_author ON saved_posts(author);
-        CREATE INDEX IF NOT EXISTS idx_saved_posts_published_at ON saved_posts(published_at);
-        CREATE INDEX IF NOT EXISTS idx_saved_posts_last_seen_at ON saved_posts(last_seen_at);
-
-        CREATE TABLE IF NOT EXISTS sync_runs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            started_at TEXT NOT NULL,
-            finished_at TEXT,
-            source_url TEXT NOT NULL,
-            status TEXT NOT NULL,
-            fetched_count INTEGER DEFAULT 0,
-            inserted_count INTEGER DEFAULT 0,
-            updated_count INTEGER DEFAULT 0,
-            error TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS enrichment_runs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            reddit_fullname TEXT NOT NULL,
-            provider TEXT NOT NULL,
-            model TEXT NOT NULL,
-            prompt_version TEXT NOT NULL,
-            status TEXT NOT NULL,
-            raw_response TEXT,
-            classification TEXT,
-            tags_json TEXT,
-            summary TEXT,
-            joy_value REAL,
-            work_value REAL,
-            recommended_action TEXT,
-            rationale TEXT,
-            confidence REAL,
-            error TEXT,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY (reddit_fullname) REFERENCES saved_posts(reddit_fullname)
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_enrichment_runs_post_created
-            ON enrichment_runs(reddit_fullname, created_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_enrichment_runs_post_id
-            ON enrichment_runs(reddit_fullname, id DESC);
-        CREATE INDEX IF NOT EXISTS idx_enrichment_runs_status
-            ON enrichment_runs(status);
-        CREATE INDEX IF NOT EXISTS idx_enrichment_runs_action
-            ON enrichment_runs(recommended_action);
-
-        CREATE TABLE IF NOT EXISTS outbound_captures (
-            reddit_fullname TEXT PRIMARY KEY,
-            original_url TEXT NOT NULL,
-            final_url TEXT,
-            canonical_url TEXT,
-            title TEXT,
-            description TEXT,
-            site_name TEXT,
-            preview_image_url TEXT,
-            content_markdown TEXT,
-            content_hash TEXT,
-            status TEXT NOT NULL,
-            http_status INTEGER,
-            error TEXT,
-            fetched_at TEXT NOT NULL,
-            attempt_count INTEGER NOT NULL DEFAULT 1,
-            FOREIGN KEY (reddit_fullname) REFERENCES saved_posts(reddit_fullname)
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_outbound_captures_status
-            ON outbound_captures(status);
-        CREATE INDEX IF NOT EXISTS idx_outbound_captures_fetched_at
-            ON outbound_captures(fetched_at);
-
-        CREATE TABLE IF NOT EXISTS post_tags (
-            reddit_fullname TEXT NOT NULL REFERENCES saved_posts(reddit_fullname),
-            topic TEXT NOT NULL,
-            score REAL NOT NULL,
-            threshold REAL NOT NULL,
-            passed INTEGER NOT NULL,
-            matched_rules TEXT NOT NULL,
-            signals TEXT,
-            ruleset_version TEXT NOT NULL,
-            tagged_at TEXT NOT NULL,
-            PRIMARY KEY (reddit_fullname, topic)
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_post_tags_topic ON post_tags(topic, passed);
-        CREATE INDEX IF NOT EXISTS idx_post_tags_score ON post_tags(topic, score DESC);
-        "#,
-    )
-    .context("failed to initialize database schema")?;
-
-    ensure_column(&conn, "saved_posts", "content_markdown", "TEXT")?;
-    ensure_column(&conn, "outbound_captures", "content_markdown", "TEXT")?;
-    ensure_column(&conn, "outbound_captures", "content_hash", "TEXT")?;
-    migrate_content_html_to_markdown(&conn)?;
-    init_fts(&conn)?;
+    // Repair any external-content FTS index that drifted from its content table
+    // (rows predating the index, or a partially populated index). This runs on
+    // every open, independent of the migration version, so it also backfills a
+    // freshly created index for rows a baseline migration just imported.
     rebuild_stale_fts_index(&conn)?;
 
     Ok(conn)
-}
-
-fn init_fts(conn: &Connection) -> Result<()> {
-    // Each FTS5 table is external-content (`content=`/`content_rowid='rowid'`):
-    // it stores only the inverted index and reads document text from its content
-    // table by rowid, kept in sync by AFTER INSERT/DELETE/UPDATE triggers that
-    // mirror `old.rowid`/`new.rowid`. The aux `capture_fts`/`enrichment_fts`
-    // tables (RSS-36) mirror the `posts_fts` pattern exactly so a future
-    // multi-source search can UNION all three; see `search::search_multi_source`
-    // and docs/explanation/fts-multi-source.md. NULL columns index as empty text,
-    // so posts without a capture or enrichment simply never appear in those
-    // indexes. The FTS column names must match real columns on the content table
-    // because the `'rebuild'` command re-reads them by name.
-    conn.execute_batch(
-        r#"
-        CREATE VIRTUAL TABLE IF NOT EXISTS posts_fts USING fts5(
-            title,
-            content_markdown,
-            content='saved_posts',
-            content_rowid='rowid',
-            tokenize='porter unicode61'
-        );
-
-        CREATE TRIGGER IF NOT EXISTS saved_posts_ai AFTER INSERT ON saved_posts BEGIN
-            INSERT INTO posts_fts(rowid, title, content_markdown)
-            VALUES (new.rowid, new.title, new.content_markdown);
-        END;
-
-        CREATE TRIGGER IF NOT EXISTS saved_posts_ad AFTER DELETE ON saved_posts BEGIN
-            INSERT INTO posts_fts(posts_fts, rowid, title, content_markdown)
-            VALUES ('delete', old.rowid, old.title, old.content_markdown);
-        END;
-
-        CREATE TRIGGER IF NOT EXISTS saved_posts_au AFTER UPDATE ON saved_posts BEGIN
-            INSERT INTO posts_fts(posts_fts, rowid, title, content_markdown)
-            VALUES ('delete', old.rowid, old.title, old.content_markdown);
-            INSERT INTO posts_fts(rowid, title, content_markdown)
-            VALUES (new.rowid, new.title, new.content_markdown);
-        END;
-
-        CREATE VIRTUAL TABLE IF NOT EXISTS capture_fts USING fts5(
-            title,
-            description,
-            site_name,
-            content_markdown,
-            content='outbound_captures',
-            content_rowid='rowid',
-            tokenize='porter unicode61'
-        );
-
-        CREATE TRIGGER IF NOT EXISTS outbound_captures_ai AFTER INSERT ON outbound_captures BEGIN
-            INSERT INTO capture_fts(rowid, title, description, site_name, content_markdown)
-            VALUES (new.rowid, new.title, new.description, new.site_name, new.content_markdown);
-        END;
-
-        CREATE TRIGGER IF NOT EXISTS outbound_captures_ad AFTER DELETE ON outbound_captures BEGIN
-            INSERT INTO capture_fts(capture_fts, rowid, title, description, site_name, content_markdown)
-            VALUES ('delete', old.rowid, old.title, old.description, old.site_name, old.content_markdown);
-        END;
-
-        CREATE TRIGGER IF NOT EXISTS outbound_captures_au AFTER UPDATE ON outbound_captures BEGIN
-            INSERT INTO capture_fts(capture_fts, rowid, title, description, site_name, content_markdown)
-            VALUES ('delete', old.rowid, old.title, old.description, old.site_name, old.content_markdown);
-            INSERT INTO capture_fts(rowid, title, description, site_name, content_markdown)
-            VALUES (new.rowid, new.title, new.description, new.site_name, new.content_markdown);
-        END;
-
-        CREATE VIRTUAL TABLE IF NOT EXISTS enrichment_fts USING fts5(
-            classification,
-            tags_json,
-            summary,
-            rationale,
-            content='enrichment_runs',
-            content_rowid='rowid',
-            tokenize='porter unicode61'
-        );
-
-        CREATE TRIGGER IF NOT EXISTS enrichment_runs_ai AFTER INSERT ON enrichment_runs BEGIN
-            INSERT INTO enrichment_fts(rowid, classification, tags_json, summary, rationale)
-            VALUES (new.rowid, new.classification, new.tags_json, new.summary, new.rationale);
-        END;
-
-        CREATE TRIGGER IF NOT EXISTS enrichment_runs_ad AFTER DELETE ON enrichment_runs BEGIN
-            INSERT INTO enrichment_fts(enrichment_fts, rowid, classification, tags_json, summary, rationale)
-            VALUES ('delete', old.rowid, old.classification, old.tags_json, old.summary, old.rationale);
-        END;
-
-        CREATE TRIGGER IF NOT EXISTS enrichment_runs_au AFTER UPDATE ON enrichment_runs BEGIN
-            INSERT INTO enrichment_fts(enrichment_fts, rowid, classification, tags_json, summary, rationale)
-            VALUES ('delete', old.rowid, old.classification, old.tags_json, old.summary, old.rationale);
-            INSERT INTO enrichment_fts(rowid, classification, tags_json, summary, rationale)
-            VALUES (new.rowid, new.classification, new.tags_json, new.summary, new.rationale);
-        END;
-        "#,
-    )
-    .context("failed to initialize full-text search schema")?;
-
-    Ok(())
 }
 
 fn rebuild_stale_fts_index(conn: &Connection) -> Result<()> {
@@ -285,61 +87,12 @@ fn rebuild_index_if_stale(conn: &Connection, content_table: &str, fts_table: &st
     Ok(())
 }
 
-fn ensure_column(conn: &Connection, table: &str, column: &str, column_type: &str) -> Result<()> {
-    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-    let columns = stmt
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-
-    if !columns.iter().any(|name| name == column) {
-        conn.execute(
-            &format!("ALTER TABLE {table} ADD COLUMN {column} {column_type}"),
-            [],
-        )
-        .context(format!("failed to add {table}.{column}"))?;
-    }
-
-    Ok(())
-}
-
-fn migrate_content_html_to_markdown(conn: &Connection) -> Result<()> {
-    let mut stmt = conn.prepare("PRAGMA table_info(saved_posts)")?;
-    let columns = stmt
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-
-    if !columns.iter().any(|name| name == "content_html") {
-        return Ok(());
-    }
-
-    let mut stmt = conn.prepare(
-        "SELECT reddit_fullname, content_html FROM saved_posts
-         WHERE content_markdown IS NULL AND content_html IS NOT NULL",
-    )?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    drop(stmt);
-
-    for (fullname, html) in rows {
-        let markdown = html2md::parse_html(&html).trim().to_string();
-        conn.execute(
-            "UPDATE saved_posts SET content_markdown = ? WHERE reddit_fullname = ?",
-            params![markdown, fullname],
-        )
-        .context("failed to migrate content_html to content_markdown")?;
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::test_support::unique_db_path;
     use crate::db::{SearchFilters, search_posts};
+    use rusqlite::params;
 
     #[test]
     fn init_db_rebuilds_fts_for_preexisting_rows() {
@@ -544,5 +297,115 @@ mod tests {
             })
             .expect("count should query");
         assert_eq!(indexed_after, 0, "orphaned FTS index should be cleared");
+    }
+
+    fn user_version(conn: &Connection) -> i64 {
+        conn.query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("user_version should query")
+    }
+
+    #[test]
+    fn fresh_db_lands_at_latest_user_version() {
+        let conn = init_db(&unique_db_path("fresh_version")).expect("init should succeed");
+        assert_eq!(
+            user_version(&conn),
+            migrations::LATEST_VERSION,
+            "a freshly initialized database should be at the latest schema version"
+        );
+    }
+
+    #[test]
+    fn reinit_on_up_to_date_db_is_idempotent() {
+        let path = unique_db_path("idempotent");
+        let conn = init_db(&path).expect("first init should succeed");
+        assert_eq!(user_version(&conn), migrations::LATEST_VERSION);
+        drop(conn);
+
+        // Re-running init on an up-to-date DB must apply no migrations and leave
+        // the version unchanged.
+        let conn = init_db(&path).expect("re-init should succeed");
+        assert_eq!(
+            user_version(&conn),
+            migrations::LATEST_VERSION,
+            "re-running init must not advance past the latest version"
+        );
+    }
+
+    #[test]
+    fn upgrade_from_pre_user_version_schema_advances_version_without_data_loss() {
+        // A pre-user_version database: content_html, no content_markdown/
+        // content_hash, no FTS tables, and user_version still 0.
+        let path = unique_db_path("upgrade_version");
+        let conn = Connection::open(&path).expect("db should open");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE saved_posts (
+                reddit_fullname TEXT PRIMARY KEY,
+                reddit_id TEXT,
+                title TEXT NOT NULL,
+                author TEXT,
+                subreddit TEXT,
+                permalink TEXT NOT NULL,
+                outbound_url TEXT,
+                content_html TEXT,
+                thumbnail_url TEXT,
+                published_at TEXT,
+                updated_at TEXT,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'atom',
+                raw_entry TEXT
+            );
+            INSERT INTO saved_posts (
+                reddit_fullname, reddit_id, title, permalink, content_html,
+                first_seen_at, last_seen_at, source
+            ) VALUES (
+                't3_legacy', 'legacy', 'Legacy Post',
+                'https://reddit.com/r/rust/comments/legacy/',
+                '<p>Durable <strong>Content</strong></p>',
+                '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'atom'
+            );
+            "#,
+        )
+        .expect("legacy schema should be created");
+        assert_eq!(
+            user_version(&conn),
+            0,
+            "precondition: legacy DB is version 0"
+        );
+        drop(conn);
+
+        let conn = init_db(&path).expect("init should upgrade legacy schema");
+
+        // Version advanced to the latest.
+        assert_eq!(user_version(&conn), migrations::LATEST_VERSION);
+
+        // Columns added by later migrations now exist.
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(saved_posts)")
+            .expect("pragma should prepare");
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("columns should query")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("columns should collect");
+        assert!(columns.contains(&"content_markdown".to_string()));
+
+        // Original row survived and its content was converted, not lost.
+        let (title, markdown): (String, String) = conn
+            .query_row(
+                "SELECT title, content_markdown FROM saved_posts WHERE reddit_fullname = 't3_legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("legacy row should survive the upgrade");
+        assert_eq!(title, "Legacy Post");
+        assert_eq!(markdown, "Durable **Content**");
+
+        // And the converted content is searchable through the new FTS index.
+        let hits = search_posts(&conn, "Durable", &SearchFilters::default(), 10)
+            .expect("upgraded content should search");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].reddit_fullname, "t3_legacy");
     }
 }

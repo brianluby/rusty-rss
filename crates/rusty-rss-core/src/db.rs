@@ -8,6 +8,7 @@
 mod captures;
 mod enrichment;
 mod export;
+mod migrations;
 mod posts;
 mod schema;
 mod search;
