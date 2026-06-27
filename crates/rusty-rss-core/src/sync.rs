@@ -5,21 +5,27 @@ use crate::models::SyncResult;
 use crate::parse;
 use anyhow::Result;
 use chrono::Utc;
-use rusqlite::params;
+use rusqlite::{Connection, params};
 use std::collections::HashSet;
 
 pub async fn run_sync(config: &Config) -> Result<SyncResult> {
     let client = fetch::build_http_client(&config.user_agent);
     let now = Utc::now();
 
-    let run_id = record_sync_start(&config.db_path, &config.feed_url, &now)?;
+    // Open and migrate the database once per run; the single connection is
+    // threaded through start -> do_sync -> end so every sync_runs INSERT/UPDATE
+    // and upsert_post share it (and `last_insert_rowid()` reads the run id from
+    // the same connection that inserted it).
+    let conn = db::init_db(&config.db_path)?;
 
-    let result = do_sync(&client, config).await;
+    let run_id = record_sync_start(&conn, &config.feed_url, &now)?;
+
+    let result = do_sync(&client, &conn, config).await;
 
     match &result {
         Ok(sr) => {
             record_sync_end(
-                &config.db_path,
+                &conn,
                 run_id,
                 "success",
                 sr.fetched_count,
@@ -29,23 +35,18 @@ pub async fn run_sync(config: &Config) -> Result<SyncResult> {
             )?;
         }
         Err(e) => {
-            record_sync_end(
-                &config.db_path,
-                run_id,
-                "error",
-                0,
-                0,
-                0,
-                Some(&e.to_string()),
-            )?;
+            record_sync_end(&conn, run_id, "error", 0, 0, 0, Some(&e.to_string()))?;
         }
     }
 
     result
 }
 
-async fn do_sync(client: &reqwest::Client, config: &Config) -> Result<SyncResult> {
-    let conn = db::init_db(&config.db_path)?;
+async fn do_sync(
+    client: &reqwest::Client,
+    conn: &Connection,
+    config: &Config,
+) -> Result<SyncResult> {
     let mut result = SyncResult::new();
     let mut after = None;
     let mut seen_ids = HashSet::new();
@@ -72,7 +73,7 @@ async fn do_sync(client: &reqwest::Client, config: &Config) -> Result<SyncResult
                 page_new_ids += 1;
             }
 
-            match db::upsert_post(&conn, post) {
+            match db::upsert_post(conn, post) {
                 Ok(UpsertResult::Inserted) => result.inserted_count += 1,
                 Ok(UpsertResult::Updated) => result.updated_count += 1,
                 Ok(UpsertResult::Unchanged) => result.unchanged_count += 1,
@@ -120,11 +121,10 @@ fn paginated_url(
 }
 
 fn record_sync_start(
-    db_path: &std::path::Path,
+    conn: &Connection,
     source_url: &str,
     now: &chrono::DateTime<Utc>,
 ) -> Result<i64> {
-    let conn = db::init_db(db_path)?;
     conn.execute(
         "INSERT INTO sync_runs (started_at, source_url, status) VALUES (?, ?, ?)",
         params![now.to_rfc3339(), source_url, "running"],
@@ -133,7 +133,7 @@ fn record_sync_start(
 }
 
 fn record_sync_end(
-    db_path: &std::path::Path,
+    conn: &Connection,
     run_id: i64,
     status: &str,
     fetched: usize,
@@ -141,7 +141,6 @@ fn record_sync_end(
     updated: usize,
     error: Option<&str>,
 ) -> Result<()> {
-    let conn = db::init_db(db_path)?;
     conn.execute(
         "UPDATE sync_runs SET finished_at = ?, status = ?, fetched_count = ?, inserted_count = ?, updated_count = ?, error = ? WHERE id = ?",
         params![
@@ -336,13 +335,13 @@ mod tests {
     fn records_failed_sync_end() {
         let db_path = test_db_path();
         let now = Utc::now();
-        let run_id = record_sync_start(&db_path, "https://example.com/feed", &now)
+        let conn = db::init_db(&db_path).expect("db should open");
+        let run_id = record_sync_start(&conn, "https://example.com/feed", &now)
             .expect("sync start should be recorded");
 
-        record_sync_end(&db_path, run_id, "error", 0, 0, 0, Some("boom"))
+        record_sync_end(&conn, run_id, "error", 0, 0, 0, Some("boom"))
             .expect("sync end should be recorded");
 
-        let conn = db::init_db(&db_path).expect("db should open");
         let status: String = conn
             .query_row(
                 "SELECT status FROM sync_runs WHERE id = ?",
