@@ -2,18 +2,41 @@
 
 use rusty_rss_core::db;
 use rusty_rss_core::models::SavedPost;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn test_db_path() -> PathBuf {
     let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
+    let path = std::env::temp_dir().join(format!(
         "rusty_rss_cli_test_{}_{}.db",
         std::process::id(),
         id
-    ))
+    ));
+    reset_db_file(&path);
+    path
+}
+
+/// Remove a stale test database and its SQLite sidecars so a reused path
+/// (process id + counter) never inherits data from an earlier run. Covers the
+/// default rollback-journal mode (`-journal`) and WAL mode (`-wal`/`-shm`) so it
+/// stays correct regardless of journal_mode. A missing file is fine; any other
+/// I/O error is surfaced rather than silently ignored.
+fn reset_db_file(path: &Path) {
+    for suffix in ["", "-journal", "-wal", "-shm"] {
+        let mut target = path.as_os_str().to_owned();
+        target.push(suffix);
+        let target = PathBuf::from(target);
+        match std::fs::remove_file(&target) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => panic!(
+                "failed to remove stale test db file {}: {err}",
+                target.display()
+            ),
+        }
+    }
 }
 
 pub(crate) fn insert_post(db_path: &std::path::Path) {

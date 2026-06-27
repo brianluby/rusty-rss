@@ -2,6 +2,7 @@
 
 use crate::db::init_db;
 use crate::models::{Classification, EnrichmentOutput, RecommendedAction, SavedPost};
+use crate::test_support::reset_db_file;
 use chrono::Utc;
 use rusqlite::Connection;
 use std::path::PathBuf;
@@ -17,7 +18,7 @@ pub(crate) fn unique_db_path(tag: &str) -> PathBuf {
 
 pub(crate) fn test_db() -> Connection {
     let path = unique_db_path("test");
-    let _ = std::fs::remove_file(&path);
+    reset_db_file(&path);
     init_db(&path).expect("init db should succeed")
 }
 
