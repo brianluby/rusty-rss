@@ -2,3 +2,6 @@
 *.sqlite3
 *.sqlite3-*
 .serena/cache/
+.serena/memories/
+/tarpaulin-report.html
+.DS_Store

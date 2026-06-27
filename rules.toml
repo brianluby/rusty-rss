@@ -1,0 +1,206 @@
+# Gate 1 rule engine — tagging config (rules-as-data).
+#
+# Re-runnable, token-free first filter over saved posts. The `tag` command
+# compiles each rule into column-scoped FTS5 queries, scores posts additively,
+# applies subreddit priors and vetoes, and writes one `post_tags` row per topic
+# a post scores in. Edit terms/weights/thresholds and re-run `rusty-rss tag`;
+# no recompile. See docs/prd/rule-engine.md and docs/how-to/tag-posts.md.
+#
+# Conventions and v1 scope:
+#   - signal: "title" | "body" (self-post text) | "any". "subreddit"/"domain"
+#     match rules are rejected; use [topics.<t>.subreddit_prior] for subreddits.
+#   - kind: "fts" (one FTS5 expression) | "terms" (a list of literal tokens; a
+#     trailing * means prefix). "exact"/"regex" are not supported in rules-v1.
+#   - weight: points added once when a rule fires. min_hits: a rule fires only
+#     when >= N distinct OR-alternatives (fts) / list tokens (terms) match.
+#   - Multi-line inline tables are invalid TOML, so rules use the
+#     [[topics.<name>.rules]] array-of-tables form below.
+#   - Hyphenated phrases must be quoted ("tool use"), never bare, in fts.
+
+[meta]
+version = "rules-v1"
+
+# ===========================================================================
+# memory — broad concept gate; folds second-brain, persistence, context-eng.
+# ===========================================================================
+[topics.memory]
+threshold = 3.0
+
+[[topics.memory.rules]]
+id = "title_concept"
+signal = "title"
+kind = "fts"
+weight = 2.0
+match = 'memor* OR "second brain" OR "knowledge graph" OR obsidian OR persisten* OR "context engineering" OR retriev*'
+
+[[topics.memory.rules]]
+id = "body_concept"
+signal = "body"
+kind = "fts"
+weight = 0.5
+min_hits = 2
+match = 'memor* OR "knowledge graph" OR retriev* OR embedding* OR persisten*'
+
+[[topics.memory.rules]]
+id = "named_tool"
+signal = "any"
+kind = "terms"
+weight = 3.0
+match = ["mem0", "letta", "memgpt", "zep", "cognee", "graphiti", "langmem", "supermemory"]
+
+# Subreddit priors, from the candidate-density figures in the PRD
+# (opencodeCLI ~12%, mcp ~10%, ClaudeAI ~7%, LocalLLaMA ~3%). ChatGPTCoding and
+# ClaudeCode are inferred coding-agent siblings of ClaudeAI.
+[topics.memory.subreddit_prior]
+opencodeCLI = 2.0
+mcp = 2.0
+ClaudeAI = 1.0
+ClaudeCode = 1.0
+ChatGPTCoding = 1.0
+LocalLLaMA = 0.5
+
+# Memory-vs-hardware (VRAM) disambiguation: veto a GPU-memory title for the
+# memory topic UNLESS a named memory tool is present.
+[[topics.memory.exclude]]
+id = "hardware_memory"
+signal = "title"
+kind = "fts"
+match = 'vram OR "gpu memory" OR oom OR offload OR gddr OR "unified memory"'
+unless = { signal = "any", kind = "terms", match = ["mem0", "letta", "memgpt", "zep", "cognee", "graphiti", "langmem", "supermemory"] }
+veto = true
+
+# ===========================================================================
+# rag
+# ===========================================================================
+[topics.rag]
+threshold = 3.0
+
+[[topics.rag.rules]]
+id = "title_concept"
+signal = "title"
+kind = "fts"
+weight = 2.0
+match = 'rag OR retriev* OR "retrieval augmented" OR embedding* OR "vector search" OR text2sql'
+
+[[topics.rag.rules]]
+id = "body_concept"
+signal = "body"
+kind = "fts"
+weight = 0.5
+min_hits = 2
+match = 'rag OR retriev* OR embedding* OR "vector database" OR chunk*'
+
+[topics.rag.subreddit_prior]
+LocalLLaMA = 2.0
+mcp = 1.0
+opencodeCLI = 1.0
+ClaudeAI = 1.0
+ChatGPTCoding = 1.0
+
+# ===========================================================================
+# agents
+# ===========================================================================
+[topics.agents]
+threshold = 3.0
+
+[[topics.agents.rules]]
+id = "title_concept"
+signal = "title"
+kind = "fts"
+weight = 2.0
+match = 'agent* OR subagent* OR "multi agent"'
+
+[[topics.agents.rules]]
+id = "body_concept"
+signal = "body"
+kind = "fts"
+weight = 0.5
+min_hits = 2
+match = 'agent* OR subagent* OR orchestrat* OR "tool use"'
+
+[topics.agents.subreddit_prior]
+opencodeCLI = 2.0
+mcp = 1.0
+ClaudeAI = 1.0
+ClaudeCode = 1.0
+ChatGPTCoding = 1.0
+LocalLLaMA = 0.5
+
+# ===========================================================================
+# mcp
+# ===========================================================================
+[topics.mcp]
+threshold = 3.0
+
+[[topics.mcp.rules]]
+id = "title_concept"
+signal = "title"
+kind = "fts"
+weight = 2.0
+match = 'mcp* OR "model context protocol"'
+
+[[topics.mcp.rules]]
+id = "body_concept"
+signal = "body"
+kind = "fts"
+weight = 0.5
+min_hits = 2
+match = 'mcp* OR "model context protocol" OR "mcp server"'
+
+[topics.mcp.subreddit_prior]
+mcp = 2.0
+opencodeCLI = 1.0
+ClaudeAI = 1.0
+ChatGPTCoding = 1.0
+LocalLLaMA = 0.5
+
+# ===========================================================================
+# obsidian — own topic (high-precision single token); also multi-labels memory.
+# ===========================================================================
+[topics.obsidian]
+threshold = 2.0
+
+[[topics.obsidian.rules]]
+id = "title_concept"
+signal = "title"
+kind = "fts"
+weight = 2.0
+match = 'obsidian'
+
+[[topics.obsidian.rules]]
+id = "body_concept"
+signal = "body"
+kind = "fts"
+weight = 0.5
+min_hits = 2
+match = 'obsidian OR "personal knowledge" OR pkm'
+
+[topics.obsidian.subreddit_prior]
+ClaudeAI = 1.0
+ClaudeCode = 1.0
+opencodeCLI = 1.0
+
+# ===========================================================================
+# knowledge-graph — own topic (distinct retrieval/memory structure).
+# ===========================================================================
+[topics.knowledge-graph]
+threshold = 2.0
+
+[[topics.knowledge-graph.rules]]
+id = "title_concept"
+signal = "title"
+kind = "fts"
+weight = 2.0
+match = '"knowledge graph" OR graphrag OR "graph rag" OR graphify'
+
+[[topics.knowledge-graph.rules]]
+id = "body_concept"
+signal = "body"
+kind = "fts"
+weight = 0.5
+min_hits = 2
+match = '"knowledge graph" OR graphrag OR "entity extraction" OR triple*'
+
+[topics.knowledge-graph.subreddit_prior]
+mcp = 1.0
+ClaudeAI = 1.0

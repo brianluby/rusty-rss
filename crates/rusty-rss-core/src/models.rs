@@ -1,11 +1,12 @@
 use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 
 /// Normalized representation of a saved Reddit post from any source.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SavedPost {
     pub reddit_fullname: String,
     pub reddit_id: String,
@@ -179,6 +180,51 @@ pub struct TriageItem {
     pub enrichment: Option<EnrichmentRecord>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OutboundCapture {
+    pub reddit_fullname: String,
+    pub original_url: String,
+    pub final_url: Option<String>,
+    pub canonical_url: Option<String>,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub site_name: Option<String>,
+    pub preview_image_url: Option<String>,
+    pub content_markdown: Option<String>,
+    pub content_hash: Option<String>,
+    pub status: String,
+    pub http_status: Option<i64>,
+    pub error: Option<String>,
+    pub fetched_at: String,
+    pub attempt_count: i64,
+}
+
+/// A Gate 1 rule-engine tag: one row per `(post, topic)` that scored, with the
+/// provenance needed to explain and tune the gate. Materialized output of the
+/// `tag` command (see `docs/prd/rule-engine.md`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PostTag {
+    pub reddit_fullname: String,
+    pub topic: String,
+    pub score: f32,
+    pub threshold: f32,
+    pub passed: bool,
+    /// Rule ids that fired, plus `prior:<subreddit>` and `veto:<id>` markers.
+    pub matched_rules: Vec<String>,
+    /// Per-signal score breakdown, keyed by rule id (and `prior`).
+    pub signals: BTreeMap<String, f32>,
+    pub ruleset_version: String,
+    pub tagged_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExportRecord {
+    pub schema_version: String,
+    pub saved_post: SavedPost,
+    pub latest_enrichment: Option<EnrichmentRecord>,
+    pub outbound_capture: Option<OutboundCapture>,
+}
+
 impl SavedPost {
     pub fn new(fullname: String, title: String, permalink: String, source: String) -> Self {
         let reddit_id = fullname
@@ -278,5 +324,16 @@ mod tests {
         let err =
             serde_json::from_str::<EnrichmentOutput>(json).expect_err("unknown fields should fail");
         assert!(err.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn export_schema_sample_validates() {
+        let sample = include_str!("../../../docs/export-record-v1.sample.json");
+        let record: ExportRecord =
+            serde_json::from_str(sample).expect("sample export record should validate");
+
+        assert_eq!(record.schema_version, "rusty-rss.export.v1");
+        assert_eq!(record.saved_post.reddit_fullname, "t3_sample");
+        assert!(record.outbound_capture.is_some());
     }
 }
