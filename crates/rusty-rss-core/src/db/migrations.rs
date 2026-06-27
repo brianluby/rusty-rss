@@ -171,7 +171,7 @@ fn ensure_column(tx: &Transaction, table: &str, column: &str, column_type: &str)
         &format!("ALTER TABLE {table} ADD COLUMN {column} {column_type}"),
         [],
     )
-    .context(format!("failed to add {table}.{column}"))?;
+    .with_context(|| format!("failed to add {table}.{column}"))?;
 
     Ok(())
 }

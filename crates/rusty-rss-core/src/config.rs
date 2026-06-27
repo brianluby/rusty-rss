@@ -50,13 +50,14 @@ impl Config {
     }
 }
 
-/// Reduce a feed URL to `scheme://host[:port]/path`, dropping the query string
-/// (which carries the Reddit `feed` token and `user`) and any fragment.
+/// Reduce a feed URL to `scheme://host[:port]/path`, stripping the query string
+/// (where Reddit carries the `feed` token and `user`) and any fragment.
 ///
 /// This is the only form that should ever be persisted to `sync_runs.source_url`
-/// or shown to an operator/agent. Fails closed: if the URL cannot be parsed, the
-/// portion from the first `?` onward is discarded so a query-embedded token
-/// cannot leak.
+/// or shown to an operator/agent. Scope is limited to the query string and
+/// fragment: if the URL cannot be parsed, the portion from the first `?` onward
+/// is still discarded. A secret embedded in the URL *path* (rather than the
+/// query) is NOT removed.
 pub fn redact_feed_url(url: &str) -> String {
     match url::Url::parse(url) {
         Ok(mut parsed) => {
@@ -120,7 +121,7 @@ fn strip_url_queries(message: &str) -> String {
             .unwrap_or(from_url.len());
 
         let url = &from_url[..end];
-        let trimmed = url.split(['?', '#']).next().unwrap_or(url);
+        let trimmed = url.split_once(['?', '#']).map_or(url, |(head, _)| head);
         out.push_str(trimmed);
         rest = &from_url[end..];
     }

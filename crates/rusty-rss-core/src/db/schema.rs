@@ -408,4 +408,114 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].reddit_fullname, "t3_legacy");
     }
+
+    /// Stage a real (current) schema, then rewind `user_version` to `version` and
+    /// reintroduce a legacy `content_html` row (and, for v1, drop `content_hash`)
+    /// so the migration runner has pending work to resume. Returns the path.
+    fn stage_mid_migration_db(label: &str, version: i64) -> std::path::PathBuf {
+        let path = unique_db_path(label);
+        let conn = init_db(&path).expect("initial schema build should succeed");
+
+        conn.execute_batch("ALTER TABLE saved_posts ADD COLUMN content_html TEXT;")
+            .expect("reintroducing legacy content_html column should succeed");
+
+        // A pre-conversion row: content stored only as HTML, content_markdown NULL.
+        conn.execute(
+            "INSERT INTO saved_posts (
+                reddit_fullname, reddit_id, title, permalink, content_html,
+                content_markdown, first_seen_at, last_seen_at, source
+            ) VALUES (
+                't3_mid', 'mid', 'Mid Migration Post',
+                'https://reddit.com/r/rust/comments/mid/',
+                '<p>Resumable <strong>State</strong></p>', NULL,
+                '2026-02-02T00:00:00Z', '2026-02-02T00:00:00Z', 'atom'
+            )",
+            [],
+        )
+        .expect("legacy row should insert");
+
+        if version == 1 {
+            // At v1 the migration-2 columns are not yet present, so dropping
+            // content_hash forces migration 2 to do real work on resume.
+            conn.execute_batch("ALTER TABLE outbound_captures DROP COLUMN content_hash;")
+                .expect("dropping content_hash to simulate pre-migration-2 state should succeed");
+        }
+
+        conn.execute_batch(&format!("PRAGMA user_version = {version};"))
+            .expect("rewinding user_version should succeed");
+        drop(conn);
+        path
+    }
+
+    /// A column name appears in `PRAGMA table_info(table)`.
+    fn has_column(conn: &Connection, table: &str, column: &str) -> bool {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .expect("pragma should prepare");
+        stmt.query_map([], |row| row.get::<_, String>(1))
+            .expect("columns should query")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("columns should collect")
+            .iter()
+            .any(|name| name == column)
+    }
+
+    #[test]
+    fn init_db_resumes_from_mid_migration_user_version_1() {
+        let path = stage_mid_migration_db("mid_v1", 1);
+
+        let conn = init_db(&path).expect("init should resume migrations from v1");
+
+        assert_eq!(
+            user_version(&conn),
+            migrations::LATEST_VERSION,
+            "a DB stalled at v1 must finish at the latest version"
+        );
+        // Migration 2 re-added the dropped column.
+        assert!(
+            has_column(&conn, "outbound_captures", "content_hash"),
+            "migration 2 should restore content_hash on resume"
+        );
+        // Migration 3 converted the legacy HTML without losing the row.
+        let markdown: String = conn
+            .query_row(
+                "SELECT content_markdown FROM saved_posts WHERE reddit_fullname = 't3_mid'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("legacy row should survive the resumed migration");
+        assert_eq!(markdown, "Resumable **State**");
+
+        let hits = search_posts(&conn, "Resumable", &SearchFilters::default(), 10)
+            .expect("converted content should search");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].reddit_fullname, "t3_mid");
+    }
+
+    #[test]
+    fn init_db_resumes_from_mid_migration_user_version_2() {
+        let path = stage_mid_migration_db("mid_v2", 2);
+
+        let conn = init_db(&path).expect("init should resume migrations from v2");
+
+        assert_eq!(
+            user_version(&conn),
+            migrations::LATEST_VERSION,
+            "a DB stalled at v2 must finish at the latest version"
+        );
+        // Only migration 3 remained: convert content_html, no data loss.
+        let markdown: String = conn
+            .query_row(
+                "SELECT content_markdown FROM saved_posts WHERE reddit_fullname = 't3_mid'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("legacy row should survive the resumed migration");
+        assert_eq!(markdown, "Resumable **State**");
+
+        let hits = search_posts(&conn, "Resumable", &SearchFilters::default(), 10)
+            .expect("converted content should search");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].reddit_fullname, "t3_mid");
+    }
 }

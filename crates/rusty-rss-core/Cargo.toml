@@ -21,3 +21,6 @@ toml = "0.8"
 tracing = "0.1"
 tokio = { version = "1", features = ["macros", "net", "rt", "sync", "time"] }
 url = "2"
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -1,3 +1,4 @@
+use crate::config::{redact_error, redact_feed_url};
 use anyhow::{Context, Result, anyhow};
 use reqwest::Client;
 use std::time::Duration;
@@ -12,7 +13,13 @@ pub async fn fetch_feed(client: &Client, url: &str) -> Result<String> {
         match do_fetch(client, url).await {
             Ok(body) => return Ok(body),
             Err(e) => {
-                tracing::warn!(attempt, error = %e, "fetch failed, retrying");
+                // Fail closed: reqwest's error Display embeds the full tokenized
+                // request URL (the Reddit `feed` token + `user`), and so does the
+                // non-2xx path below. Scrub both before they ever reach tracing
+                // output; the raw error is only kept locally for the caller, which
+                // redacts again before persisting/returning it.
+                let redacted = redact_error(&e.to_string(), url);
+                tracing::warn!(attempt, error = %redacted, "fetch failed, retrying");
                 last_err = Some(e);
                 if attempt < MAX_RETRIES {
                     tokio::time::sleep(Duration::from_secs(2u64.saturating_pow(attempt - 1))).await;
@@ -34,7 +41,8 @@ async fn do_fetch(client: &Client, url: &str) -> Result<String> {
 
     let status = resp.status();
     if !status.is_success() {
-        return Err(anyhow!("HTTP {} fetching {}", status, url));
+        // Never embed the raw query (feed token + user) in the error message.
+        return Err(anyhow!("HTTP {} fetching {}", status, redact_feed_url(url)));
     }
 
     let ct = resp
@@ -153,6 +161,83 @@ mod tests {
             .expect_err("HTML response should fail");
 
         assert!(err.to_string().contains("unexpected Content-Type"));
+    }
+
+    /// In-memory `MakeWriter` so a test can capture everything the tracing
+    /// subscriber emits and assert no secret ever reaches the log sink.
+    #[derive(Clone, Default)]
+    struct CapturingWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturingWriter {
+        fn contents(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("log buffer lock")).into_owned()
+        }
+    }
+
+    impl std::io::Write for CapturingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log buffer lock")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for CapturingWriter {
+        type Writer = CapturingWriter;
+
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_failures_never_leak_feed_token_into_tracing() {
+        // First attempt hits a live 503 (non-2xx error path); the one-shot server
+        // then closes, so the remaining retries fail with reqwest network errors
+        // whose Display embeds the full tokenized URL. Both paths must be scrubbed
+        // before they reach the tracing sink.
+        let (base, _requests) = serve_once("503 Service Unavailable", "application/atom+xml", "no");
+        let url = format!("{base}?feed=SECRETTOKEN&user=SECRETUSER");
+        let client = build_http_client("rusty-rss-test/1.0");
+
+        let logs = CapturingWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::WARN)
+            .without_time()
+            .finish();
+
+        // #[tokio::test] runs on a current-thread runtime, so the task stays on
+        // this thread and the thread-local default subscriber stays in scope
+        // across every await in the retry loop.
+        let guard = tracing::subscriber::set_default(subscriber);
+        let result = fetch_feed(&client, &url).await;
+        drop(guard);
+
+        assert!(
+            result.is_err(),
+            "fetch against a failing server should error"
+        );
+
+        let captured = logs.contents();
+        assert!(
+            captured.contains("fetch failed, retrying"),
+            "expected retry warnings to be captured, got: {captured:?}"
+        );
+        assert!(
+            !captured.contains("SECRETTOKEN"),
+            "feed token leaked into tracing output: {captured}"
+        );
+        assert!(
+            !captured.contains("SECRETUSER"),
+            "feed user leaked into tracing output: {captured}"
+        );
     }
 
     #[test]
