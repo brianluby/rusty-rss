@@ -8,13 +8,26 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 pub fn upsert_post(conn: &Connection, post: &SavedPost) -> Result<UpsertResult> {
     let now = Utc::now().to_rfc3339();
 
-    // An IMMEDIATE transaction takes the write lock up front so the existence
-    // check and the follow-up insert/update are atomic; concurrent writers are
-    // serialized instead of racing between the SELECT and the write.
-    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
-        .context("failed to begin upsert transaction")?;
+    // The existence check and the follow-up write must be atomic. If the caller
+    // is not already in a transaction, take a write lock up front (IMMEDIATE) so
+    // concurrent upserts serialize instead of racing between the SELECT and the
+    // write. If the caller already holds a transaction, reuse it: that provides
+    // the atomicity, and starting a nested transaction would fail.
+    if conn.is_autocommit() {
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+            .context("failed to begin upsert transaction")?;
+        let result = upsert_post_in_tx(&tx, post, &now)?;
+        tx.commit().context("failed to commit upsert")?;
+        Ok(result)
+    } else {
+        upsert_post_in_tx(conn, post, &now)
+    }
+}
 
-    let existing = tx
+/// Perform the existence check and insert/update. The caller is responsible for
+/// the surrounding transaction (see [`upsert_post`]).
+fn upsert_post_in_tx(conn: &Connection, post: &SavedPost, now: &str) -> Result<UpsertResult> {
+    let existing = conn
         .query_row(
             "SELECT reddit_id, title, author, subreddit, permalink, outbound_url,
                     content_markdown, thumbnail_url, published_at, updated_at, source
@@ -25,8 +38,8 @@ pub fn upsert_post(conn: &Connection, post: &SavedPost) -> Result<UpsertResult> 
         .optional()
         .context("failed to check existing post")?;
 
-    let result = if existing.is_none() {
-        tx.execute(
+    if existing.is_none() {
+        conn.execute(
             r#"INSERT INTO saved_posts (
                 reddit_fullname, reddit_id, title, author, subreddit,
                 permalink, outbound_url, content_markdown, thumbnail_url,
@@ -51,12 +64,12 @@ pub fn upsert_post(conn: &Connection, post: &SavedPost) -> Result<UpsertResult> 
         )
         .context("failed to insert post")?;
 
-        UpsertResult::Inserted
+        Ok(UpsertResult::Inserted)
     } else if existing
         .as_ref()
         .is_some_and(|existing| existing.differs_from(post))
     {
-        tx.execute(
+        conn.execute(
             r#"UPDATE saved_posts SET
                 reddit_id = ?, title = ?, author = ?, subreddit = ?, permalink = ?,
                 outbound_url = ?, content_markdown = ?, thumbnail_url = ?,
@@ -80,19 +93,16 @@ pub fn upsert_post(conn: &Connection, post: &SavedPost) -> Result<UpsertResult> 
         )
         .context("failed to update post")?;
 
-        UpsertResult::Updated
+        Ok(UpsertResult::Updated)
     } else {
-        tx.execute(
+        conn.execute(
             "UPDATE saved_posts SET last_seen_at = ? WHERE reddit_fullname = ?",
             params![now, post.reddit_fullname],
         )
         .context("failed to update last_seen_at")?;
 
-        UpsertResult::Unchanged
-    };
-
-    tx.commit().context("failed to commit upsert")?;
-    Ok(result)
+        Ok(UpsertResult::Unchanged)
+    }
 }
 
 #[derive(Debug)]

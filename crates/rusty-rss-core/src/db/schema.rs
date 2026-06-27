@@ -180,9 +180,6 @@ fn rebuild_stale_fts_index(conn: &Connection) -> Result<()> {
     let saved_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM saved_posts", [], |row| row.get(0))
         .context("failed to count saved posts for FTS rebuild")?;
-    if saved_count == 0 {
-        return Ok(());
-    }
 
     let indexed_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM posts_fts_docsize", [], |row| {
@@ -423,5 +420,40 @@ mod tests {
             .expect("rebuilt index should search");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].reddit_fullname, "t3_two");
+    }
+
+    #[test]
+    fn init_db_clears_orphaned_fts_index_when_table_empty() {
+        let path = unique_db_path("fts_orphan");
+        let conn = init_db(&path).expect("init should succeed");
+        conn.execute(
+            "INSERT INTO saved_posts
+                 (reddit_fullname, reddit_id, title, permalink, first_seen_at, last_seen_at, source)
+             VALUES ('t3_orphan', 'orphan', 'Orphan title', 'https://example.com/',
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'atom')",
+            [],
+        )
+        .expect("insert should succeed");
+
+        // Drop the delete trigger, then clear the table so the FTS document is
+        // orphaned: saved_posts is empty but posts_fts_docsize still has a row.
+        conn.execute_batch("DROP TRIGGER saved_posts_ad; DELETE FROM saved_posts;")
+            .expect("orphaning the index should succeed");
+        let indexed_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM posts_fts_docsize", [], |row| {
+                row.get(0)
+            })
+            .expect("count should query");
+        assert_eq!(indexed_before, 1, "precondition: FTS index is orphaned");
+        drop(conn);
+
+        // Re-init must clear the orphaned index even though the table is empty.
+        let conn = init_db(&path).expect("re-init should clear orphaned index");
+        let indexed_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM posts_fts_docsize", [], |row| {
+                row.get(0)
+            })
+            .expect("count should query");
+        assert_eq!(indexed_after, 0, "orphaned FTS index should be cleared");
     }
 }
