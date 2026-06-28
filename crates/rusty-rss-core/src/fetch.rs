@@ -120,6 +120,73 @@ mod tests {
         (format!("http://{addr}/feed"), rx)
     }
 
+    /// Serve a fixed sequence of `(status, content_type, body)` responses on one
+    /// socket, one per accepted connection. Lets a test drive the retry loop:
+    /// e.g. a 503 followed by a 200 to exercise "retry then succeed".
+    fn serve_sequence(responses: Vec<(&str, &str, &str)>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("server should bind");
+        let addr = listener.local_addr().expect("local address should exist");
+        let responses: Vec<(String, String, String)> = responses
+            .into_iter()
+            .map(|(s, c, b)| (s.to_string(), c.to_string(), b.to_string()))
+            .collect();
+
+        std::thread::spawn(move || {
+            for (status, content_type, body) in responses {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut request = [0u8; 4096];
+                let _ = stream.read(&mut request);
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        format!("http://{addr}/feed")
+    }
+
+    #[tokio::test]
+    async fn fetch_feed_retries_then_succeeds() {
+        // First attempt returns a 503 (transient); the retry loop backs off and
+        // the second attempt returns a valid feed. fetch_feed must return the
+        // successful body rather than the earlier error.
+        let url = serve_sequence(vec![
+            ("503 Service Unavailable", "application/atom+xml", "down"),
+            ("200 OK", "application/atom+xml", "<feed>ok</feed>"),
+        ]);
+        let client = build_http_client("rusty-rss-test/1.0");
+
+        let body = fetch_feed(&client, &url)
+            .await
+            .expect("fetch should succeed after one retry");
+
+        assert_eq!(body, "<feed>ok</feed>");
+    }
+
+    #[tokio::test]
+    async fn fetch_feed_returns_last_error_after_exhausting_retries() {
+        // Every attempt (MAX_RETRIES) returns a 503, so the loop exhausts its
+        // budget and returns the last captured error rather than the
+        // "all fetch retries exhausted" fallback.
+        let responses = std::iter::repeat_n(
+            ("503 Service Unavailable", "application/atom+xml", "down"),
+            MAX_RETRIES as usize,
+        )
+        .collect();
+        let url = serve_sequence(responses);
+        let client = build_http_client("rusty-rss-test/1.0");
+
+        let err = fetch_feed(&client, &url)
+            .await
+            .expect_err("exhausted retries should fail");
+
+        assert!(err.to_string().contains("HTTP 503"), "got: {err}");
+    }
+
     #[tokio::test]
     async fn fetch_feed_returns_body_and_sends_user_agent() {
         let (url, requests) = serve_once("200 OK", "application/atom+xml", "<feed />");
@@ -196,6 +263,35 @@ mod tests {
         }
     }
 
+    /// Process-wide capturing subscriber, installed exactly once.
+    ///
+    /// A thread-local `set_default` subscriber is not reliable here: other tests
+    /// in this binary call `fetch_feed` with no subscriber active, and
+    /// `NoSubscriber::register_callsite` caches the `warn!` callsite's interest as
+    /// `Interest::never()`. `set_default` does not invalidate that cache, so a
+    /// late thread-local subscriber can race and capture nothing. Installing the
+    /// capturing subscriber as the *global* default runs through
+    /// `register_dispatch`, which rebuilds the callsite-interest cache and
+    /// recovers any callsite previously registered as `never`. Capturing
+    /// process-wide is harmless for the assertions below: every fetch warning is
+    /// redacted before it is emitted, so the secret tokens can never reach this
+    /// buffer from any test.
+    fn global_log_capture() -> &'static CapturingWriter {
+        use std::sync::OnceLock;
+        static CAPTURE: OnceLock<CapturingWriter> = OnceLock::new();
+        CAPTURE.get_or_init(|| {
+            let logs = CapturingWriter::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_max_level(tracing::Level::WARN)
+                .without_time()
+                .finish();
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("global default subscriber should be installable once");
+            logs
+        })
+    }
+
     #[tokio::test]
     async fn fetch_failures_never_leak_feed_token_into_tracing() {
         // First attempt hits a live 503 (non-2xx error path); the one-shot server
@@ -206,19 +302,8 @@ mod tests {
         let url = format!("{base}?feed=SECRETTOKEN&user=SECRETUSER");
         let client = build_http_client("rusty-rss-test/1.0");
 
-        let logs = CapturingWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(logs.clone())
-            .with_max_level(tracing::Level::WARN)
-            .without_time()
-            .finish();
-
-        // #[tokio::test] runs on a current-thread runtime, so the task stays on
-        // this thread and the thread-local default subscriber stays in scope
-        // across every await in the retry loop.
-        let guard = tracing::subscriber::set_default(subscriber);
+        let logs = global_log_capture();
         let result = fetch_feed(&client, &url).await;
-        drop(guard);
 
         assert!(
             result.is_err(),

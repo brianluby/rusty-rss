@@ -412,6 +412,189 @@ mod tests {
         assert!(second_request.contains("previous response was invalid"));
     }
 
+    /// Serve a single HTTP response with an arbitrary status line and body on a
+    /// fresh socket, returning the `/v1` base URL. Lets the LLM error paths
+    /// (non-2xx, malformed JSON) be exercised without a real model server.
+    fn serve_status(status: &str, body: &str) -> String {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("server should bind");
+        let addr = listener.local_addr().expect("local address should exist");
+        let status = status.to_string();
+        let body = body.to_string();
+
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut request = [0u8; 4096];
+                let _ = stream.read(&mut request);
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        format!("http://{addr}/v1")
+    }
+
+    #[test]
+    fn from_env_uses_defaults_then_overrides() {
+        // from_env must fall back to the built-in defaults when nothing is set,
+        // and honor the env overrides when present. The base URL is normalized
+        // with a trailing slash either way. SAFETY: env is mutated then restored
+        // within this single test; no other core unit test reads these vars.
+        unsafe {
+            std::env::remove_var("RUSTY_RSS_OPENAI_BASE_URL");
+            std::env::remove_var("RUSTY_RSS_OPENAI_MODEL");
+            std::env::remove_var("RUSTY_RSS_OPENAI_API_KEY");
+        }
+        let defaults = OpenAiConfig::from_env().expect("defaults should build");
+        assert_eq!(defaults.base_url.as_str(), "http://127.0.0.1:8080/v1/");
+        assert_eq!(defaults.model, "llama.cpp");
+        assert!(defaults.api_key.is_none());
+
+        unsafe {
+            std::env::set_var("RUSTY_RSS_OPENAI_BASE_URL", "https://api.example.com/v1");
+            std::env::set_var("RUSTY_RSS_OPENAI_MODEL", "gpt-test");
+            // Whitespace-only keys are filtered out to None.
+            std::env::set_var("RUSTY_RSS_OPENAI_API_KEY", "   ");
+        }
+        let overridden = OpenAiConfig::from_env().expect("override should build");
+        assert_eq!(overridden.base_url.as_str(), "https://api.example.com/v1/");
+        assert_eq!(overridden.model, "gpt-test");
+        assert!(
+            overridden.api_key.is_none(),
+            "blank api key should be filtered to None"
+        );
+
+        unsafe {
+            std::env::set_var("RUSTY_RSS_OPENAI_API_KEY", "real-key");
+        }
+        let with_key = OpenAiConfig::from_env().expect("config should build");
+        assert_eq!(with_key.api_key.as_deref(), Some("real-key"));
+
+        unsafe {
+            std::env::remove_var("RUSTY_RSS_OPENAI_BASE_URL");
+            std::env::remove_var("RUSTY_RSS_OPENAI_MODEL");
+            std::env::remove_var("RUSTY_RSS_OPENAI_API_KEY");
+        }
+    }
+
+    #[test]
+    fn new_rejects_empty_model() {
+        let err = OpenAiConfig::new(
+            "http://127.0.0.1:8080/v1".to_string(),
+            "   ".to_string(),
+            None,
+        )
+        .expect_err("blank model should fail validation");
+        assert!(matches!(err, EnrichError::Validation(_)), "got: {err:?}");
+        assert!(err.to_string().contains("model is required"));
+    }
+
+    #[test]
+    fn new_rejects_invalid_base_url() {
+        let err = OpenAiConfig::new("not a url".to_string(), "test-model".to_string(), None)
+            .expect_err("invalid base URL should fail validation");
+        assert!(matches!(err, EnrichError::Validation(_)), "got: {err:?}");
+        assert!(err.to_string().contains("invalid OpenAI base URL"));
+    }
+
+    #[tokio::test]
+    async fn chat_completion_non_2xx_is_transport_error() {
+        let provider = provider_for(serve_status("500 Internal Server Error", "upstream boom"));
+
+        let err = provider
+            .enrich(&test_post())
+            .await
+            .expect_err("non-2xx should fail");
+
+        assert!(matches!(err, EnrichError::Transport(_)), "got: {err:?}");
+        assert!(err.to_string().contains("500"));
+        assert!(err.to_string().contains("upstream boom"));
+    }
+
+    #[tokio::test]
+    async fn chat_completion_unparseable_body_is_parse_error() {
+        let provider = provider_for(serve_status("200 OK", "definitely not json"));
+
+        let err = provider
+            .enrich(&test_post())
+            .await
+            .expect_err("unparseable envelope should fail");
+
+        assert!(matches!(err, EnrichError::Parse(_)), "got: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn chat_completion_empty_content_is_parse_error() {
+        // A well-formed envelope whose only choice has blank content must be
+        // rejected with the dedicated "no content" parse error.
+        let provider = provider_for(serve_status(
+            "200 OK",
+            r#"{"choices":[{"message":{"content":"   "}}]}"#,
+        ));
+
+        let err = provider
+            .enrich(&test_post())
+            .await
+            .expect_err("empty content should fail");
+
+        assert!(matches!(err, EnrichError::Parse(_)), "got: {err:?}");
+        assert!(err.to_string().contains("no content"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn enrich_returns_parse_error_when_repair_also_fails() {
+        // Both the initial completion and the repair attempt return content that
+        // is not valid enrichment JSON, so enrich must surface a Parse error that
+        // mentions the repair failure rather than retrying forever.
+        let envelope = r#"{"choices":[{"message":{"content":"still not valid"}}]}"#.to_string();
+        let (base_url, _requests) = serve_json_responses(vec![envelope.clone(), envelope]);
+        let provider = provider_for(base_url);
+
+        let err = provider
+            .enrich(&test_post())
+            .await
+            .expect_err("two malformed responses should fail");
+
+        assert!(matches!(err, EnrichError::Parse(_)), "got: {err:?}");
+        assert!(err.to_string().contains("repair failed"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn preflight_non_2xx_is_model_unavailable() {
+        let provider = provider_for(serve_status("503 Service Unavailable", "down"));
+
+        let err = provider
+            .preflight()
+            .await
+            .expect_err("non-2xx /models should fail");
+
+        assert!(
+            matches!(err, EnrichError::ModelUnavailable(_)),
+            "got: {err:?}"
+        );
+        assert!(err.to_string().contains("503"));
+    }
+
+    #[tokio::test]
+    async fn preflight_unparseable_body_is_model_unavailable() {
+        let provider = provider_for(serve_status("200 OK", "not a models list"));
+
+        let err = provider
+            .preflight()
+            .await
+            .expect_err("unparseable /models body should fail");
+
+        assert!(
+            matches!(err, EnrichError::ModelUnavailable(_)),
+            "got: {err:?}"
+        );
+    }
+
     #[test]
     fn normalizes_base_url_for_endpoint_joining() {
         let config = OpenAiConfig::new(

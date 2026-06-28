@@ -406,6 +406,80 @@ mod tests {
         assert_eq!(comment.reddit_id, "comment2b");
     }
 
+    #[tokio::test]
+    async fn run_sync_stops_at_max_pages() {
+        // Each served page is full (entry_count == sync_limit) with fresh ids and a
+        // last_entry_id, so do_sync would keep paginating; max_pages must cap it.
+        // Only `max_pages` requests are served, so the loop must stop on its own
+        // rather than block waiting for a fourth page.
+        let db_path = test_db_path();
+        let (feed_url, requests) = serve_paginated_feeds(vec![
+            paged_feed(&["t3_p1a", "t3_p1b"]),
+            paged_feed(&["t3_p2a", "t3_p2b"]),
+        ]);
+        let mut config = config_for(feed_url, db_path.clone());
+        config.sync_limit = 2;
+        config.max_pages = 2;
+
+        let result = run_sync(&config).await.expect("sync should succeed");
+
+        assert_eq!(result.page_count, 2, "must stop exactly at max_pages");
+        assert_eq!(result.fetched_count, 4);
+        assert_eq!(result.inserted_count, 4);
+
+        // Exactly max_pages requests were issued (the third page is never fetched).
+        assert!(requests.recv().is_ok());
+        assert!(requests.recv().is_ok());
+        assert!(
+            requests.recv().is_err(),
+            "no third page should be requested at max_pages"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_sync_records_error_status_on_fetch_failure() {
+        // A persistent 503 drives run_sync down the Err arm, which must record the
+        // run as 'error' (not 'running'/'success') with a non-null error message
+        // and zeroed counts.
+        let db_path = test_db_path();
+        // fetch::MAX_RETRIES attempts are served so the retry loop exhausts.
+        let feed_url = serve_status_times("503 Service Unavailable", 3);
+        let config = config_for(feed_url, db_path.clone());
+
+        run_sync(&config)
+            .await
+            .expect_err("persistent 503 should fail the sync");
+
+        let conn = db::init_db(&db_path).expect("db should open");
+        let (status, error, fetched): (String, Option<String>, i64) = conn
+            .query_row(
+                "SELECT status, error, fetched_count FROM sync_runs LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("sync_runs row should exist");
+
+        assert_eq!(status, "error");
+        assert_eq!(fetched, 0);
+        assert!(
+            error.as_deref().is_some_and(|e| e.contains("HTTP 503")),
+            "error should be recorded, got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn paginated_url_rejects_invalid_base_url() {
+        // A non-URL base must surface the parse error rather than silently
+        // producing a malformed request URL.
+        let err = paginated_url("not a url", 100, None, 0)
+            .expect_err("invalid base URL should fail to build");
+        assert!(
+            err.to_string().to_lowercase().contains("relative url")
+                || err.to_string().to_lowercase().contains("invalid"),
+            "got: {err}"
+        );
+    }
+
     #[test]
     fn paginated_url_preserves_existing_query_and_adds_paging_params() {
         let url = paginated_url(
