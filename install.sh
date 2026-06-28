@@ -56,6 +56,70 @@ install_binaries() {
   fi
 }
 
+# Reduce a URL to scheme://host/path, dropping userinfo, query, and fragment.
+redact_url() {
+  # shellcheck disable=SC2001
+  printf '%s' "$1" | sed -E 's#^([a-zA-Z]+://[^/?#]*)(/[^?#]*)?.*#\1\2#'
+}
+
+# Prompt "question [y/N]"; return 0 for yes. Auto-yes when ASSUME_YES=1.
+confirm() {
+  if [ "$ASSUME_YES" -eq 1 ]; then return 0; fi
+  local reply
+  printf '%s [y/N] ' "$1" >&2
+  read -r reply
+  case "$reply" in [yY]|[yY][eE][sS]) return 0 ;; *) return 1 ;; esac
+}
+
+write_config() {
+  local cfg_dir env_path feed_url
+  cfg_dir="$(config_dir)"
+  env_path="$(env_file)"
+  log "Configuring $env_path"
+
+  if [ -f "$env_path" ]; then
+    local existing
+    existing="$(sed -n 's/^RUSTY_RSS_FEED_URL=//p' "$env_path" | head -1)"
+    if [ -n "$existing" ]; then
+      log "Existing feed URL: $(redact_url "$existing")"
+    fi
+    confirm "Config exists. Replace it?" || { log "Keeping existing config."; return 0; }
+  fi
+
+  if [ -n "${RUSTY_RSS_FEED_URL:-}" ]; then
+    feed_url="$RUSTY_RSS_FEED_URL"
+  elif [ "$ASSUME_YES" -eq 1 ]; then
+    die "--yes requires RUSTY_RSS_FEED_URL to be set in the environment."
+  else
+    printf 'Reddit saved-items feed URL (input hidden): ' >&2
+    read -rs feed_url
+    printf '\n' >&2
+  fi
+  case "$feed_url" in
+    http://*|https://*) ;;
+    *) die "feed URL must start with http:// or https://" ;;
+  esac
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '    write %s (RUSTY_RSS_FEED_URL=%s, RUSTY_RSS_DB_PATH=%s)\n' \
+      "$env_path" "$(redact_url "$feed_url")" "$DB_PATH"
+    return 0
+  fi
+
+  mkdir -p "$cfg_dir"; chmod 700 "$cfg_dir"
+  mkdir -p "$(dirname "$DB_PATH")"
+  umask 077
+  cat > "$env_path" <<EOF
+# rusty-rss configuration. Loaded with:
+#   set -a; source $env_path; set +a
+RUSTY_RSS_FEED_URL=$feed_url
+RUSTY_RSS_DB_PATH=$DB_PATH
+EOF
+  chmod 600 "$env_path"
+  log "Wrote $env_path (mode 600). Load it with:"
+  printf '    set -a; source %s; set +a\n' "$env_path"
+}
+
 usage() {
   cat <<'EOF'
 install.sh - build and install rusty-rss
@@ -103,6 +167,7 @@ main() {
   fi
   build_workspace
   install_binaries
+  [ "$DO_CONFIG" -eq 1 ] && write_config
 }
 
 main "$@"
