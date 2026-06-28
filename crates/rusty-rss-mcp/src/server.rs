@@ -205,6 +205,7 @@ impl RustyRssServer {
         let filters = SearchFilters {
             subreddit: params.subreddit,
             author: params.author,
+            ..SearchFilters::default()
         };
         let query = params.query;
         let hits = self

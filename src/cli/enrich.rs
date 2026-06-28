@@ -5,16 +5,29 @@ use rusty_rss_core::db;
 use rusty_rss_core::enrich::{self, EnrichOptions};
 use rusty_rss_core::llm::{OpenAiConfig, OpenAiProvider};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
-pub(super) async fn run_enrich(db_path: PathBuf, limit: usize, dry_run: bool) -> Result<()> {
+pub(super) async fn run_enrich(db_path: PathBuf, options: EnrichOptions) -> Result<()> {
     let conn = db::init_db(&db_path)?;
-    // Fetch candidates up front to gate the work: an empty list (or limit 0) must
-    // short-circuit before the provider preflight below. run_enrichment_batch
-    // re-runs this query as the authoritative source for its summary counts; the
-    // extra read is negligible for a CLI and keeps the batch self-contained.
-    let candidates = db::list_enrichment_candidates(&conn, limit)?;
+    // Resolve candidates up front to gate the work: an empty list (or limit 0)
+    // must short-circuit before the provider preflight below. The batch runner
+    // re-runs this selection as the authoritative source for its summary counts;
+    // the extra read is negligible for a CLI and keeps the batch self-contained.
+    // Using the shared selector keeps the dry-run count and the batch in sync,
+    // including the prompt-version and staleness gating.
+    //
+    // Known asymmetry: this first selection only gates the empty-batch
+    // short-circuit and the provider preflight. If it sees N>0 (so we pay the
+    // preflight) but a concurrent sync/enrich drains all N before the batch
+    // re-selects, the run prints "0 selected" after already paying the preflight
+    // cost. This is benign at personal-archive scale (the preflight is a cheap
+    // local-LLM probe) but can look misleading in a cron/daemon context. Left
+    // as-is to keep the batch the single authoritative selector; consolidating
+    // would mean threading candidates or the provider across the API boundary.
+    let candidates = enrich::select_candidates(&conn, options)?;
 
-    if dry_run {
+    if options.dry_run {
         println!("Would enrich {} posts", candidates.len());
         return Ok(());
     }
@@ -26,17 +39,12 @@ pub(super) async fn run_enrich(db_path: PathBuf, limit: usize, dry_run: bool) ->
         return Ok(());
     }
 
-    let provider = OpenAiProvider::new(OpenAiConfig::from_env()?);
+    let provider = Arc::new(OpenAiProvider::new(OpenAiConfig::from_env()?));
     provider.preflight().await?;
+    let model = provider.model().to_string();
 
-    let summary = enrich::run_enrichment_batch(
-        &conn,
-        &provider,
-        "openai-compatible",
-        provider.model(),
-        EnrichOptions::new(limit, dry_run),
-    )
-    .await?;
+    let summary =
+        enrich::run_enrichment_batch(&conn, provider, "openai-compatible", &model, options).await?;
 
     print_enrichment_summary(
         summary.selected_count,
@@ -48,6 +56,25 @@ pub(super) async fn run_enrich(db_path: PathBuf, limit: usize, dry_run: bool) ->
     }
 
     Ok(())
+}
+
+/// Build [`EnrichOptions`] from the parsed CLI flags. `stale_after_days` of
+/// `None` leaves the staleness check off (selection still re-runs on a prompt
+/// version change).
+pub(super) fn enrich_options(
+    limit: usize,
+    dry_run: bool,
+    concurrency: usize,
+    retry_attempts: u32,
+    stale_after_days: Option<u64>,
+) -> EnrichOptions {
+    EnrichOptions {
+        concurrency,
+        retry_attempts,
+        stale_after: stale_after_days
+            .map(|days| Duration::from_secs(days.saturating_mul(24 * 60 * 60))),
+        ..EnrichOptions::new(limit, dry_run)
+    }
 }
 
 /// Single source of truth for the completion line so the empty-batch
@@ -68,8 +95,33 @@ mod tests {
         // reorder it preflighted first and failed trying to reach the default
         // local provider (http://127.0.0.1:8080), even with nothing to enrich.
         let db_path = test_db_path();
-        run_enrich(db_path, 10, false)
+        run_enrich(db_path, enrich_options(10, false, 4, 3, None))
             .await
             .expect("no-work enrich should succeed without contacting the provider");
+    }
+
+    #[test]
+    fn enrich_options_maps_flags_and_staleness_window() {
+        let opts = enrich_options(7, true, 2, 5, Some(3));
+        assert_eq!(opts.limit, 7);
+        assert!(opts.dry_run);
+        assert_eq!(opts.concurrency, 2);
+        assert_eq!(opts.retry_attempts, 5);
+        assert_eq!(
+            opts.stale_after,
+            Some(Duration::from_secs(3 * 24 * 60 * 60))
+        );
+
+        let none = enrich_options(1, false, 1, 1, None);
+        assert_eq!(none.stale_after, None);
+    }
+
+    #[test]
+    fn enrich_options_saturates_overflowing_staleness_window() {
+        // A huge --stale-after-days must saturate to u64::MAX seconds rather
+        // than overflowing the `days * 24 * 60 * 60` multiplication (which panics
+        // in debug builds).
+        let opts = enrich_options(1, false, 1, 1, Some(u64::MAX));
+        assert_eq!(opts.stale_after, Some(Duration::from_secs(u64::MAX)));
     }
 }

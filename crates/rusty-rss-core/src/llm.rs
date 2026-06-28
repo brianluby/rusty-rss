@@ -28,6 +28,23 @@ pub enum EnrichError {
     Validation(String),
 }
 
+impl EnrichError {
+    /// Whether this failure is worth retrying. Only infrastructure faults
+    /// (`Transport`, `ModelUnavailable`) are transient: a later attempt may
+    /// succeed once the network blip clears or the endpoint comes back. `Parse`
+    /// and `Validation` are deterministic given the same prompt and input, so
+    /// retrying them just burns the budget — fail fast instead.
+    pub fn is_transient(&self) -> bool {
+        // Exhaustive on purpose: a new variant must make a deliberate
+        // retryable/terminal decision here rather than defaulting to
+        // non-retryable behind a `matches!` wildcard.
+        match self {
+            Self::Transport(_) | Self::ModelUnavailable(_) => true,
+            Self::Parse(_) | Self::Validation(_) => false,
+        }
+    }
+}
+
 pub type EnrichResult<T> = std::result::Result<T, EnrichError>;
 pub type EnrichFuture<'a> =
     Pin<Box<dyn Future<Output = EnrichResult<EnrichmentResult>> + Send + 'a>>;

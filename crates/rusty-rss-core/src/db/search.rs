@@ -1,12 +1,63 @@
-//! Full-text search over `posts_fts` (bm25 ranking, snippets, query normalization).
+//! Full-text search across posts, captures, and enrichment (bm25 ranking,
+//! snippets, query normalization, cross-source merge).
 
 use anyhow::{Context, Result, anyhow};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, named_params};
+
+/// Which full-text indexes a search query consults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SearchSource {
+    /// Saved-post title and body only (the historical default; zero regression).
+    #[default]
+    Posts,
+    /// Captured outbound-page text only.
+    Capture,
+    /// Enrichment output (latest successful run) only.
+    Enrichment,
+    /// All three sources merged.
+    All,
+}
+
+impl SearchSource {
+    /// Parse a `--source` flag value. Returns `None` for unrecognized input so
+    /// the caller can surface a clear error.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "posts" | "post" => Some(Self::Posts),
+            "capture" | "captures" => Some(Self::Capture),
+            "enrichment" | "enrich" => Some(Self::Enrichment),
+            "all" => Some(Self::All),
+            _ => None,
+        }
+    }
+
+    fn includes_posts(self) -> bool {
+        matches!(self, Self::Posts | Self::All)
+    }
+
+    fn includes_capture(self) -> bool {
+        matches!(self, Self::Capture | Self::All)
+    }
+
+    fn includes_enrichment(self) -> bool {
+        matches!(self, Self::Enrichment | Self::All)
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct SearchFilters {
     pub subreddit: Option<String>,
     pub author: Option<String>,
+    /// Which index(es) to search. Defaults to [`SearchSource::Posts`].
+    pub source: SearchSource,
+    /// Keep only posts that have a successful outbound capture.
+    pub has_capture: bool,
+    /// Keep only posts that have a successful enrichment run.
+    pub has_enrichment: bool,
+    /// Keep only posts whose latest enrichment carries this classification.
+    pub classification: Option<String>,
+    /// Keep only posts whose latest enrichment recommends this action.
+    pub action: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -19,71 +70,27 @@ pub struct SearchHit {
     pub outbound_url: Option<String>,
     pub snippet: String,
     pub rank: f64,
+    /// Which source produced the best-ranked match: `posts`, `capture`, or
+    /// `enrichment`.
+    pub source: String,
     pub last_seen_at: String,
 }
 
+/// Post-only search: the historical entry point, preserved for the MCP server
+/// and any caller that wants the zero-regression behavior regardless of the
+/// `source` field on `filters`. Delegates to [`search`] with the source pinned
+/// to [`SearchSource::Posts`].
 pub fn search_posts(
     conn: &Connection,
     query: &str,
     filters: &SearchFilters,
     limit: usize,
 ) -> Result<Vec<SearchHit>> {
-    if limit == 0 {
-        return Ok(Vec::new());
-    }
-
-    let fts_query = normalize_fts_query(query)?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT p.reddit_fullname,
-                    p.title,
-                    p.author,
-                    p.subreddit,
-                    p.permalink,
-                    p.outbound_url,
-                    snippet(posts_fts, -1, '<mark>', '</mark>', '...', 32) AS snippet,
-                    bm25(posts_fts, 10.0, 1.0) AS rank,
-                    p.last_seen_at
-             FROM posts_fts
-             JOIN saved_posts p ON p.rowid = posts_fts.rowid
-             WHERE posts_fts MATCH ?
-               AND (? IS NULL OR p.subreddit = ? COLLATE NOCASE)
-               AND (? IS NULL OR p.author = ? COLLATE NOCASE)
-             ORDER BY rank ASC, p.last_seen_at DESC
-             LIMIT ?",
-        )
-        .context("failed to prepare search query")?;
-
-    let rows = stmt
-        .query_map(
-            params![
-                fts_query,
-                filters.subreddit.as_deref(),
-                filters.subreddit.as_deref(),
-                filters.author.as_deref(),
-                filters.author.as_deref(),
-                limit,
-            ],
-            |row| {
-                Ok(SearchHit {
-                    reddit_fullname: row.get(0)?,
-                    title: row.get(1)?,
-                    author: row.get(2)?,
-                    subreddit: row.get(3)?,
-                    permalink: row.get(4)?,
-                    outbound_url: row.get(5)?,
-                    snippet: row.get(6)?,
-                    rank: row.get(7)?,
-                    last_seen_at: row.get(8)?,
-                })
-            },
-        )
-        // The query syntax was already validated in normalize_fts_query, so an
-        // error here is a database failure, not bad user input.
-        .context("failed to execute search query")?;
-
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .context("failed to collect search results")
+    let filters = SearchFilters {
+        source: SearchSource::Posts,
+        ..filters.clone()
+    };
+    search(conn, query, &filters, limit)
 }
 
 /// Every external-content FTS5 index in the schema, each keyed to its content
@@ -157,95 +164,177 @@ fn is_fts_corruption(err: &rusqlite::Error) -> bool {
     )
 }
 
-/// Prototype scaffolding (RSS-36): merged full-text search across all three
-/// external-content FTS indexes.
+// Per-source BM25 penalty added to each match's rank (lower rank sorts first,
+// and SQLite BM25 returns negative scores, so a positive penalty biases toward
+// the more authoritative source). Posts (the user's own title/body) are the
+// primary signal and get no penalty; captured page text is secondary; model-
+// generated enrichment is the least authoritative. The penalties are small
+// relative to typical BM25 magnitudes, so a markedly stronger lower-tier match
+// can still outrank a weak post match — see docs/explanation/fts-multi-source.md.
+const POSTS_ARM: &str = "
+    SELECT sp.reddit_fullname AS reddit_fullname,
+           bm25(posts_fts, 10.0, 1.0) AS rank,
+           snippet(posts_fts, -1, '<mark>', '</mark>', '...', 32) AS snippet,
+           'posts' AS source
+    FROM posts_fts
+    JOIN saved_posts sp ON sp.rowid = posts_fts.rowid
+    WHERE posts_fts MATCH :q";
+
+const CAPTURE_ARM: &str = "
+    SELECT oc.reddit_fullname AS reddit_fullname,
+           bm25(capture_fts) + 1.0 AS rank,
+           snippet(capture_fts, -1, '<mark>', '</mark>', '...', 32) AS snippet,
+           'capture' AS source
+    FROM capture_fts
+    JOIN outbound_captures oc ON oc.rowid = capture_fts.rowid
+    WHERE capture_fts MATCH :q";
+
+// Enrichment is 1:many per post. Index only the latest *successful* run so a
+// stale older run never resurfaces in search; this also collapses the 1:many
+// fan-out before the cross-source dedup. Chosen over a partial index / new
+// migration: external-content FTS5 cannot express "newest row per group", and a
+// query-time `MAX(id)` filter keeps the index plain and the schema unchanged.
+const ENRICHMENT_ARM: &str = "
+    SELECT er.reddit_fullname AS reddit_fullname,
+           bm25(enrichment_fts) + 2.0 AS rank,
+           snippet(enrichment_fts, -1, '<mark>', '</mark>', '...', 32) AS snippet,
+           'enrichment' AS source
+    FROM enrichment_fts
+    JOIN enrichment_runs er ON er.rowid = enrichment_fts.rowid
+    WHERE enrichment_fts MATCH :q
+      AND er.status = 'success'
+      AND er.id = (
+          SELECT MAX(e2.id) FROM enrichment_runs e2
+          WHERE e2.reddit_fullname = er.reddit_fullname AND e2.status = 'success'
+      )";
+
+/// Full-text search across the sources selected by `filters.source`.
 ///
-/// UNIONs `posts_fts` ∪ `capture_fts` ∪ `enrichment_fts`, resolving every FTS
-/// `rowid` back to its owning `saved_posts.reddit_fullname`
-/// (`capture_fts.rowid` → `outbound_captures.rowid` → `reddit_fullname`;
-/// `enrichment_fts.rowid` → `enrichment_runs.rowid` → `reddit_fullname`). A post
-/// that matches in several sources — or several enrichment runs (1:many) — is
-/// de-duplicated by `reddit_fullname`, keeping the single best (lowest) BM25
-/// rank and that match's snippet.
-///
-/// This is **unwired prototype scaffolding**: the shipped CLI still calls
-/// [`search_posts`], which is deliberately untouched. BM25 ranks are only
-/// roughly comparable across tables (each index weights its own columns), so
-/// ordering *between* sources is approximate. See
-/// `docs/explanation/fts-multi-source.md` for the design and open tradeoffs.
-pub fn search_multi_source(conn: &Connection, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
+/// Merges `posts_fts` / `capture_fts` / `enrichment_fts` with `UNION ALL`,
+/// resolving every FTS `rowid` back to its owning `saved_posts.reddit_fullname`,
+/// then de-duplicates by `reddit_fullname` keeping the single best (lowest,
+/// source-penalized) BM25 rank, its snippet, and which source matched. The
+/// subreddit/author and capture/enrichment/classification/action filters are
+/// applied to the resolved post (the latter four against the post's latest
+/// successful enrichment run). `search_posts` is the post-only entry point.
+pub fn search(
+    conn: &Connection,
+    query: &str,
+    filters: &SearchFilters,
+    limit: usize,
+) -> Result<Vec<SearchHit>> {
     if limit == 0 {
         return Ok(Vec::new());
     }
 
     let fts_query = normalize_fts_query(query)?;
+
+    let mut arms: Vec<&str> = Vec::new();
+    if filters.source.includes_posts() {
+        arms.push(POSTS_ARM);
+    }
+    if filters.source.includes_capture() {
+        arms.push(CAPTURE_ARM);
+    }
+    if filters.source.includes_enrichment() {
+        arms.push(ENRICHMENT_ARM);
+    }
+    let matches_cte = arms.join("\n    UNION ALL\n");
+
+    // Boolean filters are appended as static clauses (no params, no injection
+    // surface); the string filters bind named params so NULL disables them.
+    let mut extra = String::new();
+    if filters.has_capture {
+        extra.push_str(
+            " AND EXISTS (SELECT 1 FROM outbound_captures oc \
+               WHERE oc.reddit_fullname = p.reddit_fullname AND oc.status = 'success')",
+        );
+    }
+    if filters.has_enrichment {
+        extra.push_str(" AND le.id IS NOT NULL");
+    }
+
+    // MATERIALIZED is load-bearing: the FTS5 `bm25()`/`snippet()` aux functions
+    // are only valid in a SELECT that directly references the FTS table with a
+    // MATCH. Forcing the CTE to materialize evaluates every arm exactly once in
+    // that valid context; the `best`/snippet/source references downstream then
+    // read plain columns. Without it SQLite may inline the CTE into the
+    // aggregating/correlated parents, where bm25 fails with "unable to use
+    // function bm25 in the requested context".
+    let sql = format!(
+        "WITH matches AS MATERIALIZED (
+            {matches_cte}
+         ),
+         best AS (
+             SELECT reddit_fullname, MIN(rank) AS rank
+             FROM matches
+             GROUP BY reddit_fullname
+         )
+         SELECT p.reddit_fullname,
+                p.title,
+                p.author,
+                p.subreddit,
+                p.permalink,
+                p.outbound_url,
+                (SELECT m.snippet FROM matches m
+                 WHERE m.reddit_fullname = b.reddit_fullname
+                 ORDER BY m.rank ASC LIMIT 1) AS snippet,
+                b.rank,
+                (SELECT m.source FROM matches m
+                 WHERE m.reddit_fullname = b.reddit_fullname
+                 ORDER BY m.rank ASC LIMIT 1) AS source,
+                p.last_seen_at
+         FROM best b
+         JOIN saved_posts p ON p.reddit_fullname = b.reddit_fullname
+         LEFT JOIN enrichment_runs le ON le.id = (
+             SELECT MAX(e.id) FROM enrichment_runs e
+             WHERE e.reddit_fullname = p.reddit_fullname AND e.status = 'success'
+         )
+         WHERE 1 = 1
+           AND (:subreddit IS NULL OR p.subreddit = :subreddit COLLATE NOCASE)
+           AND (:author IS NULL OR p.author = :author COLLATE NOCASE)
+           AND (:classification IS NULL OR le.classification = :classification COLLATE NOCASE)
+           AND (:action IS NULL OR le.recommended_action = :action COLLATE NOCASE)
+           {extra}
+         ORDER BY b.rank ASC, p.last_seen_at DESC
+         LIMIT :limit"
+    );
+
     let mut stmt = conn
-        .prepare(
-            "WITH matches AS (
-                 SELECT sp.reddit_fullname AS reddit_fullname,
-                        bm25(posts_fts, 10.0, 1.0) AS rank,
-                        snippet(posts_fts, -1, '<mark>', '</mark>', '...', 32) AS snippet
-                 FROM posts_fts
-                 JOIN saved_posts sp ON sp.rowid = posts_fts.rowid
-                 WHERE posts_fts MATCH ?1
-                 UNION ALL
-                 SELECT oc.reddit_fullname AS reddit_fullname,
-                        bm25(capture_fts) AS rank,
-                        snippet(capture_fts, -1, '<mark>', '</mark>', '...', 32) AS snippet
-                 FROM capture_fts
-                 JOIN outbound_captures oc ON oc.rowid = capture_fts.rowid
-                 WHERE capture_fts MATCH ?1
-                 UNION ALL
-                 SELECT er.reddit_fullname AS reddit_fullname,
-                        bm25(enrichment_fts) AS rank,
-                        snippet(enrichment_fts, -1, '<mark>', '</mark>', '...', 32) AS snippet
-                 FROM enrichment_fts
-                 JOIN enrichment_runs er ON er.rowid = enrichment_fts.rowid
-                 WHERE enrichment_fts MATCH ?1
-             ),
-             best AS (
-                 SELECT reddit_fullname, MIN(rank) AS rank
-                 FROM matches
-                 GROUP BY reddit_fullname
-             )
-             SELECT p.reddit_fullname,
-                    p.title,
-                    p.author,
-                    p.subreddit,
-                    p.permalink,
-                    p.outbound_url,
-                    (SELECT m.snippet FROM matches m
-                     WHERE m.reddit_fullname = b.reddit_fullname
-                     ORDER BY m.rank ASC LIMIT 1) AS snippet,
-                    b.rank,
-                    p.last_seen_at
-             FROM best b
-             JOIN saved_posts p ON p.reddit_fullname = b.reddit_fullname
-             ORDER BY b.rank ASC, p.last_seen_at DESC
-             LIMIT ?2",
-        )
-        .context("failed to prepare multi-source search query")?;
+        .prepare(&sql)
+        .context("failed to prepare search query")?;
 
     let rows = stmt
-        .query_map(params![fts_query, limit], |row| {
-            Ok(SearchHit {
-                reddit_fullname: row.get(0)?,
-                title: row.get(1)?,
-                author: row.get(2)?,
-                subreddit: row.get(3)?,
-                permalink: row.get(4)?,
-                outbound_url: row.get(5)?,
-                snippet: row.get(6)?,
-                rank: row.get(7)?,
-                last_seen_at: row.get(8)?,
-            })
-        })
+        .query_map(
+            named_params! {
+                ":q": fts_query,
+                ":subreddit": filters.subreddit.as_deref(),
+                ":author": filters.author.as_deref(),
+                ":classification": filters.classification.as_deref(),
+                ":action": filters.action.as_deref(),
+                ":limit": limit,
+            },
+            |row| {
+                Ok(SearchHit {
+                    reddit_fullname: row.get(0)?,
+                    title: row.get(1)?,
+                    author: row.get(2)?,
+                    subreddit: row.get(3)?,
+                    permalink: row.get(4)?,
+                    outbound_url: row.get(5)?,
+                    snippet: row.get(6)?,
+                    rank: row.get(7)?,
+                    source: row.get(8)?,
+                    last_seen_at: row.get(9)?,
+                })
+            },
+        )
         // The query syntax was already validated in normalize_fts_query, so an
         // error here is a database failure, not bad user input.
-        .context("failed to execute multi-source search query")?;
+        .context("failed to execute search query")?;
 
     rows.collect::<std::result::Result<Vec<_>, _>>()
-        .context("failed to collect multi-source search results")
+        .context("failed to collect search results")
 }
 
 fn normalize_fts_query(query: &str) -> Result<String> {
@@ -309,6 +398,7 @@ mod tests {
         OutboundCaptureUpsert, record_enrichment_success, upsert_outbound_capture, upsert_post,
     };
     use crate::models::RecommendedAction;
+    use rusqlite::params;
 
     #[test]
     fn fts_triggers_keep_index_in_sync() {
@@ -391,6 +481,7 @@ mod tests {
             &SearchFilters {
                 subreddit: Some("rust".to_string()),
                 author: Some("alice".to_string()),
+                ..SearchFilters::default()
             },
             10,
         )
@@ -415,6 +506,7 @@ mod tests {
             &SearchFilters {
                 subreddit: Some("rust".to_string()),
                 author: Some("alice".to_string()),
+                ..SearchFilters::default()
             },
             10,
         )
@@ -643,13 +735,16 @@ mod tests {
         }
     }
 
-    /// Prototype scaffolding (RSS-36): the merged multi-source search must resolve
-    /// matches from each external-content aux FTS table back to the owning post
-    /// and de-duplicate by `reddit_fullname`, keeping a single best-ranked hit.
-    #[test]
-    fn search_multi_source_resolves_and_dedupes_across_sources() {
-        let conn = test_db();
+    fn all_sources() -> SearchFilters {
+        SearchFilters {
+            source: SearchSource::All,
+            ..SearchFilters::default()
+        }
+    }
 
+    /// Stage three posts, one matching only in each source, plus a term shared
+    /// between a post and its capture, exercising the cross-source merge.
+    fn seed_multi_source(conn: &Connection) {
         // Post A: a term unique to the post body (posts_fts path) plus a term
         // shared with its capture (cross-source dedup path).
         let mut post_a = test_post();
@@ -657,8 +752,8 @@ mod tests {
         post_a.reddit_id = "postonly".to_string();
         post_a.title = "Plain heading".to_string();
         post_a.content_markdown = Some("xenon body argon overlap".to_string());
-        upsert_post(&conn, &post_a).expect("post a should insert");
-        upsert_outbound_capture(&conn, &capture_with("t3_postonly", "argon mirrored"))
+        upsert_post(conn, &post_a).expect("post a should insert");
+        upsert_outbound_capture(conn, &capture_with("t3_postonly", "argon mirrored"))
             .expect("capture a should insert");
 
         // Post B: the term lives only in the outbound capture (capture_fts path).
@@ -667,21 +762,21 @@ mod tests {
         post_b.reddit_id = "captureonly".to_string();
         post_b.title = "Unrelated heading".to_string();
         post_b.content_markdown = Some("nothing notable".to_string());
-        upsert_post(&conn, &post_b).expect("post b should insert");
-        upsert_outbound_capture(&conn, &capture_with("t3_captureonly", "krypton deep dive"))
+        upsert_post(conn, &post_b).expect("post b should insert");
+        upsert_outbound_capture(conn, &capture_with("t3_captureonly", "krypton deep dive"))
             .expect("capture b should insert");
 
         // Post C: the term lives only in enrichment output (enrichment_fts path),
-        // recorded twice to exercise the 1:many dedup-by-fullname.
+        // recorded twice to exercise the latest-run-only / 1:many dedup.
         let mut post_c = test_post();
         post_c.reddit_fullname = "t3_enrichonly".to_string();
         post_c.reddit_id = "enrichonly".to_string();
         post_c.title = "Another heading".to_string();
         post_c.content_markdown = Some("plain text".to_string());
-        upsert_post(&conn, &post_c).expect("post c should insert");
+        upsert_post(conn, &post_c).expect("post c should insert");
         for summary in ["radon first run", "radon second run"] {
             record_enrichment_success(
-                &conn,
+                conn,
                 "t3_enrichonly",
                 "provider",
                 "model",
@@ -691,44 +786,217 @@ mod tests {
             )
             .expect("enrichment should insert");
         }
+    }
 
-        // Each source resolves to exactly its owning post.
-        let post_hits =
-            search_multi_source(&conn, "xenon", 10).expect("post search should succeed");
+    /// The merged search resolves matches from each aux FTS table back to the
+    /// owning post, reports which source matched, and de-duplicates by fullname.
+    #[test]
+    fn search_all_sources_resolves_dedupes_and_reports_source() {
+        let conn = test_db();
+        seed_multi_source(&conn);
+
+        // Each source resolves to exactly its owning post with the right source.
+        let post_hits = search(&conn, "xenon", &all_sources(), 10).expect("post search succeeds");
         assert_eq!(post_hits.len(), 1);
         assert_eq!(post_hits[0].reddit_fullname, "t3_postonly");
+        assert_eq!(post_hits[0].source, "posts");
 
         let capture_hits =
-            search_multi_source(&conn, "krypton", 10).expect("capture search should succeed");
+            search(&conn, "krypton", &all_sources(), 10).expect("capture search succeeds");
         assert_eq!(capture_hits.len(), 1);
         assert_eq!(capture_hits[0].reddit_fullname, "t3_captureonly");
+        assert_eq!(capture_hits[0].source, "capture");
 
         let enrich_hits =
-            search_multi_source(&conn, "radon", 10).expect("enrichment search should succeed");
+            search(&conn, "radon", &all_sources(), 10).expect("enrichment search succeeds");
         assert_eq!(
             enrich_hits.len(),
             1,
             "1:many enrichment dedupes by fullname"
         );
         assert_eq!(enrich_hits[0].reddit_fullname, "t3_enrichonly");
+        assert_eq!(enrich_hits[0].source, "enrichment");
 
-        // A term present in both a post and its capture yields a single hit.
+        // A term present in both a post and its capture yields a single hit, and
+        // the more authoritative post source wins the dedup.
         let shared_hits =
-            search_multi_source(&conn, "argon", 10).expect("shared search should succeed");
-        assert_eq!(
-            shared_hits.len(),
-            1,
-            "matches dedupe across sources by fullname"
-        );
+            search(&conn, "argon", &all_sources(), 10).expect("shared search succeeds");
+        assert_eq!(shared_hits.len(), 1, "matches dedupe across sources");
         assert_eq!(shared_hits[0].reddit_fullname, "t3_postonly");
+        assert_eq!(shared_hits[0].source, "posts");
+    }
+
+    /// `source` scopes which indexes are consulted: a capture-only term is found
+    /// under `capture`/`all` but not under `posts` or `enrichment`.
+    #[test]
+    fn search_source_scopes_the_indexes() {
+        let conn = test_db();
+        seed_multi_source(&conn);
+
+        let posts_only = SearchFilters {
+            source: SearchSource::Posts,
+            ..SearchFilters::default()
+        };
+        assert!(
+            search(&conn, "krypton", &posts_only, 10)
+                .expect("posts search succeeds")
+                .is_empty(),
+            "a capture-only term must not surface under source=posts"
+        );
+
+        let capture_only = SearchFilters {
+            source: SearchSource::Capture,
+            ..SearchFilters::default()
+        };
+        let hits = search(&conn, "krypton", &capture_only, 10).expect("capture search succeeds");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].source, "capture");
+
+        let enrichment_only = SearchFilters {
+            source: SearchSource::Enrichment,
+            ..SearchFilters::default()
+        };
+        assert!(
+            search(&conn, "krypton", &enrichment_only, 10)
+                .expect("enrichment search succeeds")
+                .is_empty(),
+            "a capture-only term must not surface under source=enrichment"
+        );
+    }
+
+    /// The has_capture / has_enrichment / classification / action filters narrow
+    /// the resolved post set, composing with the full-text match.
+    #[test]
+    fn search_metadata_filters_narrow_results() {
+        let conn = test_db();
+
+        // Two posts share the search term; only one has a capture and enrichment.
+        let mut enriched = test_post();
+        enriched.reddit_fullname = "t3_meta_enriched".to_string();
+        enriched.reddit_id = "metaenriched".to_string();
+        enriched.title = "tungsten alloy".to_string();
+        upsert_post(&conn, &enriched).expect("post should insert");
+        upsert_outbound_capture(
+            &conn,
+            &capture_with("t3_meta_enriched", "supporting capture"),
+        )
+        .expect("capture should insert");
+        let mut output = test_output(RecommendedAction::ShouldBuild, "build it");
+        output.classification = crate::models::Classification::Tool;
+        record_enrichment_success(
+            &conn,
+            "t3_meta_enriched",
+            "provider",
+            "model",
+            "prompt",
+            "raw",
+            &output,
+        )
+        .expect("enrichment should insert");
+
+        let mut bare = test_post();
+        bare.reddit_fullname = "t3_meta_bare".to_string();
+        bare.reddit_id = "metabare".to_string();
+        bare.title = "tungsten ingot".to_string();
+        upsert_post(&conn, &bare).expect("post should insert");
+
+        // Without filters, both posts match.
+        let all = search(&conn, "tungsten", &all_sources(), 10).expect("search succeeds");
+        assert_eq!(all.len(), 2);
+
+        // has_capture keeps only the post with a capture.
+        let with_capture = SearchFilters {
+            source: SearchSource::All,
+            has_capture: true,
+            ..SearchFilters::default()
+        };
+        let hits = search(&conn, "tungsten", &with_capture, 10).expect("search succeeds");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].reddit_fullname, "t3_meta_enriched");
+
+        // has_enrichment + classification + action all target the enriched post.
+        let enriched_filter = SearchFilters {
+            source: SearchSource::All,
+            has_enrichment: true,
+            classification: Some("tool".to_string()),
+            action: Some("should_build".to_string()),
+            ..SearchFilters::default()
+        };
+        let hits = search(&conn, "tungsten", &enriched_filter, 10).expect("search succeeds");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].reddit_fullname, "t3_meta_enriched");
+
+        // A non-matching classification filters everything out.
+        let wrong_class = SearchFilters {
+            source: SearchSource::All,
+            classification: Some("article".to_string()),
+            ..SearchFilters::default()
+        };
+        assert!(
+            search(&conn, "tungsten", &wrong_class, 10)
+                .expect("search succeeds")
+                .is_empty()
+        );
+    }
+
+    /// Only the latest successful enrichment run is searchable: a term that lived
+    /// solely in an older run no longer matches once a newer run supersedes it.
+    #[test]
+    fn search_enrichment_uses_latest_run_only() {
+        let conn = test_db();
+        let mut post = test_post();
+        post.reddit_fullname = "t3_latest".to_string();
+        post.reddit_id = "latest".to_string();
+        post.title = "Neutral heading".to_string();
+        post.content_markdown = Some("neutral body".to_string());
+        upsert_post(&conn, &post).expect("post should insert");
+
+        record_enrichment_success(
+            &conn,
+            "t3_latest",
+            "provider",
+            "model",
+            "prompt",
+            "raw",
+            &test_output(RecommendedAction::ReadingQueue, "promethium summary"),
+        )
+        .expect("first run should insert");
+        record_enrichment_success(
+            &conn,
+            "t3_latest",
+            "provider",
+            "model",
+            "prompt",
+            "raw",
+            &test_output(RecommendedAction::ReadingQueue, "francium summary"),
+        )
+        .expect("second run should insert");
+
+        let stale = search(&conn, "promethium", &all_sources(), 10).expect("search succeeds");
+        assert!(stale.is_empty(), "older run's text must not be searchable");
+        let current = search(&conn, "francium", &all_sources(), 10).expect("search succeeds");
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].reddit_fullname, "t3_latest");
     }
 
     #[test]
-    fn search_multi_source_respects_zero_limit() {
+    fn search_respects_zero_limit() {
         let conn = test_db();
         let post = test_post();
         upsert_post(&conn, &post).expect("post should insert");
-        let hits = search_multi_source(&conn, "markdown", 0).expect("zero limit should succeed");
+        let hits = search(&conn, "markdown", &all_sources(), 0).expect("zero limit should succeed");
         assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn post_only_search_reports_posts_source() {
+        let conn = test_db();
+        let mut post = test_post();
+        post.title = "Cobalt heading".to_string();
+        upsert_post(&conn, &post).expect("post should insert");
+        let hits = search_posts(&conn, "cobalt", &SearchFilters::default(), 10)
+            .expect("search should succeed");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].source, "posts");
     }
 }

@@ -308,8 +308,8 @@ CREATE INDEX IF NOT EXISTS idx_post_tags_score ON post_tags(topic, score DESC);
 // stores only the inverted index and reads document text from its content table
 // by rowid, kept in sync by AFTER INSERT/DELETE/UPDATE triggers that mirror
 // `old.rowid`/`new.rowid`. The aux `capture_fts`/`enrichment_fts` tables
-// (RSS-36) mirror the `posts_fts` pattern exactly so a future multi-source
-// search can UNION all three; see `search::search_multi_source` and
+// (RSS-36) mirror the `posts_fts` pattern exactly so multi-source search can
+// UNION all three; see `search::search` and
 // docs/explanation/fts-multi-source.md. NULL columns index as empty text, so
 // posts without a capture or enrichment simply never appear in those indexes.
 // The FTS column names must match real columns on the content table because the
