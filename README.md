@@ -59,13 +59,13 @@ Read-only commands such as `list`, `show`, `search`, `triage`, and `export` do n
 
 ## Agent Access
 
-The workspace includes a read-only stdio MCP server:
+The workspace includes a read-only stdio MCP server built on the official [`rmcp`](https://crates.io/crates/rmcp) Rust SDK:
 
 ```bash
 rusty-rss-mcp --db-path ./rusty-rss.sqlite3
 ```
 
-Available MCP tools are `search_posts`, `query_posts`, `list_posts`, and `show_post`. Agents should prefer MCP for read-only archive access and use CLI JSON or JSONL output as the fallback.
+Available MCP tools are `search` (FTS over titles and content), `list` (recent posts), `show` (one post by fullname), and `triage` (enrichment-driven views such as `should-build` and `reading-queue`). Each tool advertises a JSON Schema for its arguments. Agents should prefer MCP for read-only archive access and use CLI JSON or JSONL output as the fallback.
 
 See [Agent Usage](docs/agents/usage.md) and [Tool Manifest v1](docs/agents/tool-manifest.v1.json).
 

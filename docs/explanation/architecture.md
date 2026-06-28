@@ -35,10 +35,10 @@ Read-only archive surfaces:
 - `search`
 - `triage`
 - `export`
-- MCP `list_posts`
-- MCP `show_post`
-- MCP `search_posts`
-- MCP `query_posts`
+- MCP `search`
+- MCP `list`
+- MCP `show`
+- MCP `triage`
 
 Write surfaces:
 
