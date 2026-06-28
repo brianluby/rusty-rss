@@ -37,12 +37,12 @@ History of sync attempts.
 | `id` | Autoincrement primary key. |
 | `started_at` | Sync start timestamp. |
 | `finished_at` | Sync finish timestamp, when available. |
-| `source_url` | Feed URL used for the run. |
+| `source_url` | Redacted feed URL: `scheme://host/path` only. The query string (which carries the Reddit `feed` token and `user`) is stripped before storage, so the token and user are never persisted here. |
 | `status` | `running`, `success`, or `error`. |
 | `fetched_count` | Feed entries fetched. |
 | `inserted_count` | Saved posts inserted. |
 | `updated_count` | Saved posts updated. |
-| `error` | Run-level error, when the sync fails. |
+| `error` | Run-level error, when the sync fails. Redacted before storage: any feed token or user embedded in a fetch error (for example a tokenized request URL) is scrubbed. |
 
 ## `enrichment_runs`
 

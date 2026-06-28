@@ -1,25 +1,31 @@
-use crate::config::Config;
+use crate::config::{self, Config};
 use crate::db::{self, UpsertResult};
 use crate::fetch;
 use crate::models::SyncResult;
 use crate::parse;
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use chrono::Utc;
-use rusqlite::params;
+use rusqlite::{Connection, params};
 use std::collections::HashSet;
 
 pub async fn run_sync(config: &Config) -> Result<SyncResult> {
     let client = fetch::build_http_client(&config.user_agent);
     let now = Utc::now();
 
-    let run_id = record_sync_start(&config.db_path, &config.feed_url, &now)?;
+    // Open and migrate the database once per run; the single connection is
+    // threaded through start -> do_sync -> end so every sync_runs INSERT/UPDATE
+    // and upsert_post share it (and `last_insert_rowid()` reads the run id from
+    // the same connection that inserted it).
+    let conn = db::init_db(&config.db_path)?;
 
-    let result = do_sync(&client, config).await;
+    let run_id = record_sync_start(&conn, &config.feed_url, &now)?;
 
-    match &result {
+    let result = do_sync(&client, &conn, config).await;
+
+    match result {
         Ok(sr) => {
             record_sync_end(
-                &config.db_path,
+                &conn,
                 run_id,
                 "success",
                 sr.fetched_count,
@@ -27,25 +33,24 @@ pub async fn run_sync(config: &Config) -> Result<SyncResult> {
                 sr.updated_count,
                 None,
             )?;
+            Ok(sr)
         }
         Err(e) => {
-            record_sync_end(
-                &config.db_path,
-                run_id,
-                "error",
-                0,
-                0,
-                0,
-                Some(&e.to_string()),
-            )?;
+            // Fail closed: scrub the feed token/user out of the error before it
+            // is persisted to sync_runs.error AND before it is returned to the
+            // caller (agents, CLI), since fetch errors embed the tokenized URL.
+            let redacted = config::redact_error(&e.to_string(), &config.feed_url);
+            record_sync_end(&conn, run_id, "error", 0, 0, 0, Some(&redacted))?;
+            Err(anyhow!(redacted))
         }
     }
-
-    result
 }
 
-async fn do_sync(client: &reqwest::Client, config: &Config) -> Result<SyncResult> {
-    let conn = db::init_db(&config.db_path)?;
+async fn do_sync(
+    client: &reqwest::Client,
+    conn: &Connection,
+    config: &Config,
+) -> Result<SyncResult> {
     let mut result = SyncResult::new();
     let mut after = None;
     let mut seen_ids = HashSet::new();
@@ -72,7 +77,7 @@ async fn do_sync(client: &reqwest::Client, config: &Config) -> Result<SyncResult
                 page_new_ids += 1;
             }
 
-            match db::upsert_post(&conn, post) {
+            match db::upsert_post(conn, post) {
                 Ok(UpsertResult::Inserted) => result.inserted_count += 1,
                 Ok(UpsertResult::Updated) => result.updated_count += 1,
                 Ok(UpsertResult::Unchanged) => result.unchanged_count += 1,
@@ -120,20 +125,22 @@ fn paginated_url(
 }
 
 fn record_sync_start(
-    db_path: &std::path::Path,
+    conn: &Connection,
     source_url: &str,
     now: &chrono::DateTime<Utc>,
 ) -> Result<i64> {
-    let conn = db::init_db(db_path)?;
+    // Persist only the redacted host+path form: the raw feed URL carries the
+    // Reddit feed token and user in its query string and must never be stored.
+    let redacted = config::redact_feed_url(source_url);
     conn.execute(
         "INSERT INTO sync_runs (started_at, source_url, status) VALUES (?, ?, ?)",
-        params![now.to_rfc3339(), source_url, "running"],
+        params![now.to_rfc3339(), redacted, "running"],
     )?;
     Ok(conn.last_insert_rowid())
 }
 
 fn record_sync_end(
-    db_path: &std::path::Path,
+    conn: &Connection,
     run_id: i64,
     status: &str,
     fetched: usize,
@@ -141,7 +148,6 @@ fn record_sync_end(
     updated: usize,
     error: Option<&str>,
 ) -> Result<()> {
-    let conn = db::init_db(db_path)?;
     conn.execute(
         "UPDATE sync_runs SET finished_at = ?, status = ?, fetched_count = ?, inserted_count = ?, updated_count = ?, error = ? WHERE id = ?",
         params![
@@ -336,13 +342,13 @@ mod tests {
     fn records_failed_sync_end() {
         let db_path = test_db_path();
         let now = Utc::now();
-        let run_id = record_sync_start(&db_path, "https://example.com/feed", &now)
+        let conn = db::init_db(&db_path).expect("db should open");
+        let run_id = record_sync_start(&conn, "https://example.com/feed", &now)
             .expect("sync start should be recorded");
 
-        record_sync_end(&db_path, run_id, "error", 0, 0, 0, Some("boom"))
+        record_sync_end(&conn, run_id, "error", 0, 0, 0, Some("boom"))
             .expect("sync end should be recorded");
 
-        let conn = db::init_db(&db_path).expect("db should open");
         let status: String = conn
             .query_row(
                 "SELECT status FROM sync_runs WHERE id = ?",
@@ -415,5 +421,110 @@ mod tests {
         assert!(url.contains("limit=100"));
         assert!(url.contains("after=t3_last"));
         assert!(url.contains("count=100"));
+    }
+
+    /// Serve `count` responses, all with the given HTTP status line, so a fetch
+    /// fails after exhausting retries. The returned URL embeds a feed token and
+    /// user so the error path can be asserted to redact them.
+    fn serve_status_times(status: &str, count: usize) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("server should bind");
+        let addr = listener.local_addr().expect("local address should exist");
+        let status = status.to_string();
+
+        std::thread::spawn(move || {
+            for _ in 0..count {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut request = [0u8; 2048];
+                let _ = stream.read(&mut request);
+                let body = "error";
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/atom+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        format!("http://{addr}/feed?feed=SECRETTOKEN&user=SECRETUSER")
+    }
+
+    #[tokio::test]
+    async fn run_sync_redacts_feed_token_in_sync_runs_source_url() {
+        let feed = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test-fixtures/atom-feed.xml"
+        ))
+        .expect("fixture should exist");
+        let db_path = test_db_path();
+        // A working feed whose URL carries the token + user in its query string.
+        let feed_url = format!("{}?feed=SECRETTOKEN&user=SECRETUSER", serve_feed(feed));
+        let config = config_for(feed_url, db_path.clone());
+
+        run_sync(&config).await.expect("sync should succeed");
+
+        let conn = db::init_db(&db_path).expect("db should open");
+        let source_url: String = conn
+            .query_row("SELECT source_url FROM sync_runs LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .expect("sync_runs row should exist");
+
+        assert!(
+            !source_url.contains("SECRETTOKEN"),
+            "token leaked into source_url: {source_url}"
+        );
+        assert!(
+            !source_url.contains("SECRETUSER"),
+            "user leaked into source_url: {source_url}"
+        );
+        assert!(
+            !source_url.contains('?'),
+            "query string should be stripped: {source_url}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_sync_redacts_feed_token_in_error_and_returned_message() {
+        let db_path = test_db_path();
+        // Persistent HTTP 503 forces the error path; the "HTTP 503 fetching <url>"
+        // message embeds the tokenized URL. MAX_RETRIES attempts are served.
+        let feed_url = serve_status_times("503 Service Unavailable", 3);
+        let config = config_for(feed_url, db_path.clone());
+
+        let err = run_sync(&config)
+            .await
+            .expect_err("sync should fail on persistent 503");
+        let returned = err.to_string();
+
+        assert!(
+            !returned.contains("SECRETTOKEN"),
+            "token leaked into returned error: {returned}"
+        );
+        assert!(
+            !returned.contains("SECRETUSER"),
+            "user leaked into returned error: {returned}"
+        );
+
+        let conn = db::init_db(&db_path).expect("db should open");
+        let (source_url, error): (String, String) = conn
+            .query_row(
+                "SELECT source_url, error FROM sync_runs LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("sync_runs row should exist");
+
+        for field in [&source_url, &error] {
+            assert!(
+                !field.contains("SECRETTOKEN"),
+                "token leaked into sync_runs: {field}"
+            );
+            assert!(
+                !field.contains("SECRETUSER"),
+                "user leaked into sync_runs: {field}"
+            );
+        }
     }
 }
