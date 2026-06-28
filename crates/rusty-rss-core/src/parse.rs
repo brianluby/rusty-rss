@@ -337,6 +337,87 @@ mod tests {
     }
 
     #[test]
+    fn parse_atom_rejects_malformed_xml() {
+        // feed-rs must reject input that is not a well-formed feed; the error is
+        // surfaced (not swallowed) so the caller can record a failed sync.
+        let err = parse_atom("<<<not a feed>>>").expect_err("malformed XML should fail");
+        assert!(
+            err.to_string().contains("failed to parse Atom feed"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn reports_entry_missing_link_href() {
+        // An entry with id + title but no <link> exercises the missing-href branch
+        // in parse_entry: the entry is rejected and reported, not panicked on.
+        let feed = r#"<?xml version="1.0"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>No Link</title>
+  <link href="https://example.com" rel="self"/>
+  <id>tag:example,2026:nolink</id>
+  <updated>2026-01-01T00:00:00Z</updated>
+  <entry>
+    <id>t3_nolink</id>
+    <title>Has title but no link</title>
+    <updated>2026-01-01T00:00:00Z</updated>
+  </entry>
+</feed>"#;
+
+        let parsed = parse_atom(feed).expect("feed parse should succeed");
+
+        assert!(parsed.posts.is_empty());
+        assert_eq!(parsed.errors.len(), 1);
+        assert!(
+            parsed.errors[0].contains("missing entry/link href"),
+            "got: {:?}",
+            parsed.errors
+        );
+    }
+
+    #[test]
+    fn non_empty_rejects_blank_id_and_trims_value() {
+        // feed-rs synthesizes an id when <id> is absent, so the empty-id branch of
+        // parse_entry is exercised directly against the non_empty guard: a
+        // whitespace-only value is rejected with the field name, and a padded
+        // value is trimmed.
+        let err = non_empty("   ".to_string(), "entry/id").expect_err("blank id should fail");
+        assert!(err.to_string().contains("missing entry/id"), "got: {err}");
+
+        let trimmed =
+            non_empty("  t3_padded  ".to_string(), "entry/id").expect("non-blank id should pass");
+        assert_eq!(trimmed, "t3_padded");
+    }
+
+    #[test]
+    fn extract_thumbnail_falls_back_to_enclosure_link() {
+        // No media:thumbnail, but an enclosure <link> is present: the thumbnail
+        // must fall back to the enclosure href.
+        let feed = r#"<?xml version="1.0"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Enclosure</title>
+  <link href="https://example.com" rel="self"/>
+  <id>tag:example,2026:enclosure</id>
+  <updated>2026-01-01T00:00:00Z</updated>
+  <entry>
+    <id>t3_enclosure</id>
+    <title>Has enclosure</title>
+    <link href="https://www.reddit.com/r/rust/comments/enclosure/" rel="alternate"/>
+    <link href="https://img.example.com/preview.jpg" rel="enclosure"/>
+    <updated>2026-01-01T00:00:00Z</updated>
+  </entry>
+</feed>"#;
+
+        let parsed = parse_atom(feed).expect("feed parse should succeed");
+
+        assert!(parsed.errors.is_empty(), "errors: {:?}", parsed.errors);
+        assert_eq!(
+            parsed.posts[0].thumbnail_url,
+            Some("https://img.example.com/preview.jpg".to_string())
+        );
+    }
+
+    #[test]
     fn reports_invalid_entries() {
         let feed = r#"<?xml version="1.0"?>
 <feed xmlns="http://www.w3.org/2005/Atom">
