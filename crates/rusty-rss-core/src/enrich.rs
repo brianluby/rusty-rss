@@ -1,3 +1,7 @@
+//! Batch enrichment orchestration: select candidate posts, call the configured
+//! LLM provider with bounded concurrency, per-item timeouts, and retries, and
+//! persist each result.
+
 use crate::db;
 use crate::llm::prompt::PROMPT_VERSION;
 use crate::llm::{EnrichmentResult, LlmProvider};
@@ -17,14 +21,18 @@ pub const DEFAULT_RETRY_ATTEMPTS: u32 = 3;
 /// Default per-item provider timeout.
 pub const DEFAULT_PER_ITEM_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Tuning knobs for an enrichment batch.
 #[derive(Debug, Clone, Copy)]
 pub struct EnrichOptions {
+    /// Maximum number of candidate posts to process this run.
     pub limit: usize,
+    /// Select candidates and report counts, but write nothing.
     pub dry_run: bool,
     /// Maximum provider calls in flight at once (clamped to at least 1).
     pub concurrency: usize,
     /// Maximum attempts per item; retries apply only to transient errors.
     pub retry_attempts: u32,
+    /// Timeout applied to each individual provider call.
     pub per_item_timeout: Duration,
     /// Re-enrich a post whose newest successful run is older than this window.
     /// `None` disables the age check (selection still re-runs on prompt change).
@@ -32,6 +40,8 @@ pub struct EnrichOptions {
 }
 
 impl EnrichOptions {
+    /// Create options for a batch of up to `limit` posts using default
+    /// concurrency, retry, and timeout settings and no staleness window.
     pub fn new(limit: usize, dry_run: bool) -> Self {
         Self {
             limit,
@@ -44,17 +54,25 @@ impl EnrichOptions {
     }
 }
 
+/// Outcome counts (and per-item failures) for a completed enrichment batch.
 #[derive(Debug, Clone, Default)]
 pub struct EnrichSummary {
+    /// Number of candidate posts selected for enrichment.
     pub selected_count: usize,
+    /// Number of posts enriched successfully.
     pub enriched_count: usize,
+    /// Number of posts that failed to enrich.
     pub failed_count: usize,
+    /// Details of each failed item.
     pub failures: Vec<EnrichFailure>,
 }
 
+/// A single failed enrichment, retained for reporting.
 #[derive(Debug, Clone)]
 pub struct EnrichFailure {
+    /// Reddit fullname of the post that failed.
     pub reddit_fullname: String,
+    /// Human-readable failure reason.
     pub error: String,
 }
 

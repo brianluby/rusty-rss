@@ -1,3 +1,11 @@
+//! LLM provider abstraction and an OpenAI-compatible implementation.
+//!
+//! The [`LlmProvider`] trait is the seam the enrichment pipeline calls; tests
+//! supply fakes and production uses [`OpenAiProvider`], which targets any
+//! OpenAI-compatible `/v1` endpoint (including a local `llama.cpp` server). The
+//! provider builds the versioned prompt, requests a schema-constrained JSON
+//! response, and repairs a malformed first response once before giving up.
+
 pub(crate) mod prompt;
 
 use self::prompt::ChatMessage;
@@ -16,14 +24,19 @@ const DEFAULT_OPENAI_BASE_URL: &str = "http://127.0.0.1:8080/v1";
 const DEFAULT_OPENAI_MODEL: &str = "llama.cpp";
 const DEFAULT_OPENAI_TIMEOUT_SECS: u64 = 60;
 
+/// An error raised while enriching a single post via an [`LlmProvider`].
 #[derive(Debug, Error)]
 pub enum EnrichError {
+    /// The HTTP request to the provider failed (network, status, body read).
     #[error("LLM transport failed: {0}")]
     Transport(String),
+    /// The endpoint is unreachable or the requested model is not available.
     #[error("LLM endpoint is unavailable: {0}")]
     ModelUnavailable(String),
+    /// The response could not be parsed into the expected JSON shape.
     #[error("LLM response parse failed: {0}")]
     Parse(String),
+    /// The parsed response failed semantic validation (e.g. out-of-range score).
     #[error("LLM output validation failed: {0}")]
     Validation(String),
 }
@@ -45,28 +58,46 @@ impl EnrichError {
     }
 }
 
+/// Result type for provider operations, using [`EnrichError`].
 pub type EnrichResult<T> = std::result::Result<T, EnrichError>;
+/// The boxed future returned by [`LlmProvider::enrich`].
 pub type EnrichFuture<'a> =
     Pin<Box<dyn Future<Output = EnrichResult<EnrichmentResult>> + Send + 'a>>;
 
+/// Abstraction over an LLM backend that enriches a single saved post.
+///
+/// Implemented by [`OpenAiProvider`] in production and by fakes in tests; the
+/// enrichment batch calls only through this trait.
 pub trait LlmProvider {
+    /// Enrich `post`, returning the raw response and parsed output (or an error).
     fn enrich<'a>(&'a self, post: &'a SavedPost) -> EnrichFuture<'a>;
 }
 
+/// A successful enrichment: the parsed output plus the raw model response.
 #[derive(Debug, Clone)]
 pub struct EnrichmentResult {
+    /// The unparsed response text from the provider, retained for auditing.
     pub raw_response: String,
+    /// The validated, normalized enrichment output.
     pub output: EnrichmentOutput,
 }
 
+/// Connection settings for an OpenAI-compatible chat-completions endpoint.
 #[derive(Debug, Clone)]
 pub struct OpenAiConfig {
+    /// Base URL of the `/v1` API (trailing slash normalized for joining).
     pub base_url: Url,
+    /// Model identifier to request.
     pub model: String,
+    /// Optional bearer token; omitted for unauthenticated local servers.
     pub api_key: Option<String>,
 }
 
 impl OpenAiConfig {
+    /// Build a config from environment variables (`RUSTY_RSS_OPENAI_BASE_URL`,
+    /// `RUSTY_RSS_OPENAI_MODEL`, `RUSTY_RSS_OPENAI_API_KEY`), falling back to
+    /// local-server defaults. Returns an error if the resulting URL/model is
+    /// invalid.
     pub fn from_env() -> EnrichResult<Self> {
         let base_url = std::env::var("RUSTY_RSS_OPENAI_BASE_URL")
             .unwrap_or_else(|_| DEFAULT_OPENAI_BASE_URL.to_string());
@@ -79,6 +110,8 @@ impl OpenAiConfig {
         Self::new(base_url, model, api_key)
     }
 
+    /// Build a config from explicit values, validating the model is non-empty
+    /// and normalizing `base_url` for endpoint joining.
     pub fn new(base_url: String, model: String, api_key: Option<String>) -> EnrichResult<Self> {
         if model.trim().is_empty() {
             return Err(EnrichError::Validation("model is required".to_string()));
@@ -94,12 +127,15 @@ impl OpenAiConfig {
     }
 }
 
+/// An [`LlmProvider`] backed by an OpenAI-compatible chat-completions API.
 pub struct OpenAiProvider {
     config: OpenAiConfig,
     client: Client,
 }
 
 impl OpenAiProvider {
+    /// Create a provider from `config`, building an HTTP client with a default
+    /// request timeout.
     pub fn new(config: OpenAiConfig) -> Self {
         Self {
             config,
@@ -110,10 +146,14 @@ impl OpenAiProvider {
         }
     }
 
+    /// The model identifier this provider requests.
     pub fn model(&self) -> &str {
         &self.config.model
     }
 
+    /// Verify the endpoint is reachable and the configured model is listed by
+    /// `GET /models`, so a batch fails fast with a clear error instead of per
+    /// item. Returns [`EnrichError::ModelUnavailable`] otherwise.
     pub async fn preflight(&self) -> EnrichResult<()> {
         let response = self
             .request(self.endpoint("models")?)

@@ -1,3 +1,6 @@
+//! Runtime configuration: loading from CLI overrides and environment variables,
+//! plus secret redaction helpers for the feed URL token and user.
+
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 
@@ -6,19 +9,34 @@ const REDACTED: &str = "[REDACTED]";
 
 const DEFAULT_USER_AGENT: &str = "rusty-rss/0.1.0";
 const DEFAULT_DB_PATH: &str = "./rusty-rss.sqlite3";
+/// Default number of posts fetched per sync when not overridden.
 pub const DEFAULT_SYNC_LIMIT: usize = 100;
+/// Default maximum number of feed pages walked per sync when not overridden.
 pub const DEFAULT_MAX_PAGES: usize = 50;
 
+/// Resolved runtime configuration for a `rusty-rss` invocation.
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Source feed URL (may carry a secret token/user in its query string).
     pub feed_url: String,
+    /// Filesystem path to the SQLite database.
     pub db_path: PathBuf,
+    /// `User-Agent` header sent with outbound requests.
     pub user_agent: String,
+    /// Maximum number of posts to ingest per sync (clamped to at least 1).
     pub sync_limit: usize,
+    /// Maximum number of feed pages to walk per sync (clamped to at least 1).
     pub max_pages: usize,
 }
 
 impl Config {
+    /// Build a [`Config`] from explicit overrides, falling back to environment
+    /// variables (`RUSTY_RSS_FEED_URL`, `RUSTY_RSS_DB_PATH`,
+    /// `RUSTY_RSS_USER_AGENT`) and then to built-in defaults.
+    ///
+    /// The feed URL is required and must parse as a valid URL; pagination values
+    /// are clamped to a minimum of 1. Returns an error if no feed URL is
+    /// available or it is malformed.
     pub fn from_env_and_overrides(
         feed_url: Option<String>,
         db_path: Option<String>,

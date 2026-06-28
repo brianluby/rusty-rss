@@ -12,9 +12,13 @@ use std::path::Path;
 /// `operands`; `weight` is then added once.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompiledRule {
+    /// Stable rule id, recorded in tag provenance.
     pub id: String,
+    /// Score added once when the rule fires.
     pub weight: f32,
+    /// Distinct operands that must match for the rule to fire.
     pub min_hits: usize,
+    /// Column-scoped FTS5 operands the rule matches against.
     pub operands: Vec<String>,
 }
 
@@ -22,24 +26,35 @@ pub struct CompiledRule {
 /// `operands` and (if present) does NOT match any `unless` operand.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompiledExclude {
+    /// Stable exclude id, recorded in tag provenance.
     pub id: String,
+    /// FTS5 operands whose match triggers the exclude.
     pub operands: Vec<String>,
+    /// Operands that, when matched, cancel the exclude.
     pub unless: Option<Vec<String>>,
 }
 
+/// A topic with its rules and excludes lowered to executable form.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompiledTopic {
+    /// Topic name.
     pub name: String,
+    /// Minimum total score for the topic to be assigned.
     pub threshold: f32,
+    /// Compiled scoring rules.
     pub rules: Vec<CompiledRule>,
+    /// Compiled exclude rules.
     pub excludes: Vec<CompiledExclude>,
+    /// Subreddit -> additive prior weight.
     pub subreddit_prior: BTreeMap<String, f32>,
 }
 
 /// All topics compiled, plus the ruleset version stamped onto written tags.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompiledRuleSet {
+    /// Ruleset version, stamped onto every written tag.
     pub version: String,
+    /// Compiled topics.
     pub topics: Vec<CompiledTopic>,
 }
 

@@ -1,3 +1,6 @@
+//! Feed synchronization: fetch the feed (paginating), parse each page, upsert
+//! posts into the database, and record the run in `sync_runs`.
+
 use crate::config::{self, Config};
 use crate::db::{self, UpsertResult};
 use crate::fetch;
@@ -8,6 +11,12 @@ use chrono::Utc;
 use rusqlite::{Connection, params};
 use std::collections::HashSet;
 
+/// Run a full feed sync described by `config`.
+///
+/// Opens and migrates the database, records a `sync_runs` row, fetches and parses
+/// the feed (walking pages up to the configured limit), upserts every post, and
+/// finalizes the run as success or error. On failure the persisted and returned
+/// error has the feed token/user scrubbed. Returns a [`SyncResult`] summary.
 pub async fn run_sync(config: &Config) -> Result<SyncResult> {
     let client = fetch::build_http_client(&config.user_agent);
     let now = Utc::now();

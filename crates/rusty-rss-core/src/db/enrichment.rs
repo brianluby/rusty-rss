@@ -78,6 +78,11 @@ pub fn list_enrichment_candidates(
         .context("failed to collect enrichment candidates")
 }
 
+/// Record a successful enrichment run and return its new row id.
+///
+/// Validates `output` before persisting (rejecting out-of-range scores etc.) and
+/// stores both the raw model response and the normalized fields. The post may
+/// already have prior runs; each call inserts a new row.
 pub fn record_enrichment_success(
     conn: &Connection,
     reddit_fullname: &str,
@@ -120,6 +125,10 @@ pub fn record_enrichment_success(
     Ok(conn.last_insert_rowid())
 }
 
+/// Record a failed enrichment attempt and return its new row id.
+///
+/// Persists the error message so failures are auditable and the post can be
+/// reselected on a later run.
 pub fn record_enrichment_failure(
     conn: &Connection,
     reddit_fullname: &str,
@@ -146,6 +155,8 @@ pub fn record_enrichment_failure(
     Ok(conn.last_insert_rowid())
 }
 
+/// Fetch the most recent enrichment run for a post (success or failure), or
+/// `None` if it has never been enriched.
 pub fn latest_enrichment(
     conn: &Connection,
     reddit_fullname: &str,
@@ -165,19 +176,31 @@ pub fn latest_enrichment(
     .context("failed to query latest enrichment")
 }
 
+/// A predefined filter over the latest enrichment of each post, used to drive
+/// triage listings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TriageView {
+    /// Every post, regardless of enrichment state.
     All,
+    /// Posts with no successful enrichment run yet.
     Unprocessed,
+    /// Posts whose latest run scored high on joy or work value.
     HighValue,
+    /// Posts whose recommended action is "should test".
     ShouldTest,
+    /// Posts whose recommended action is "should build".
     ShouldBuild,
+    /// Posts whose recommended action is "reading queue".
     ReadingQueue,
+    /// Posts whose recommended action is "reference only".
     ReferenceOnly,
+    /// Posts whose recommended action is "discard".
     Discard,
 }
 
 impl TriageView {
+    /// Parse a triage view from its string name, accepting both hyphen and
+    /// underscore spellings. Returns `None` for an unknown view.
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "all" => Some(Self::All),
@@ -193,6 +216,10 @@ impl TriageView {
     }
 }
 
+/// List posts (joined with their latest enrichment) matching a [`TriageView`].
+///
+/// Results are ordered most-recently-seen first and paginated by `limit`/
+/// `offset`. Returns an empty vector when `limit` is 0.
 pub fn list_triage_items(
     conn: &Connection,
     view: TriageView,

@@ -8,14 +8,28 @@ use super::captures::outbound_capture_from_row_with_offset;
 use super::enrichment::enrichment_record_from_row_with_offset;
 use super::posts::saved_post_from_row;
 
+/// Optional filters narrowing an export to posts whose latest enrichment matches.
+///
+/// Each `Some` field adds a constraint; `None` fields are ignored. All fields
+/// match against the most recent enrichment run for the post.
 #[derive(Debug, Clone, Default)]
 pub struct ExportFilters {
+    /// Require the latest enrichment to have this classification.
     pub classification: Option<Classification>,
+    /// Require the latest enrichment to have this recommended action.
     pub recommended_action: Option<RecommendedAction>,
+    /// Require the latest enrichment's joy value to be at least this.
     pub min_joy_value: Option<f32>,
+    /// Require the latest enrichment's work value to be at least this.
     pub min_work_value: Option<f32>,
 }
 
+/// List agent-ready export records, each joining a saved post with its latest
+/// enrichment and outbound capture.
+///
+/// Records are filtered by `filters`, ordered most-recently-seen first (with a
+/// deterministic `reddit_fullname` tiebreaker), and paginated by `limit`/
+/// `offset`. Returns an empty vector when `limit` is 0.
 pub fn list_export_records(
     conn: &Connection,
     filters: &ExportFilters,

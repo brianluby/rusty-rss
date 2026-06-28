@@ -44,9 +44,14 @@ impl SearchSource {
     }
 }
 
+/// Optional constraints layered on top of a full-text search query.
+///
+/// Each `Some`/`true` field narrows the result set; defaults match everything.
 #[derive(Debug, Clone, Default)]
 pub struct SearchFilters {
+    /// Keep only posts in this subreddit (case-insensitive).
     pub subreddit: Option<String>,
+    /// Keep only posts by this author (case-insensitive).
     pub author: Option<String>,
     /// Which index(es) to search. Defaults to [`SearchSource::Posts`].
     pub source: SearchSource,
@@ -60,19 +65,29 @@ pub struct SearchFilters {
     pub action: Option<String>,
 }
 
+/// A single search result: the matched post plus ranking and snippet metadata.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SearchHit {
+    /// Reddit fullname of the matched post.
     pub reddit_fullname: String,
+    /// Post title.
     pub title: String,
+    /// Post author, if known.
     pub author: Option<String>,
+    /// Subreddit the post belongs to, if known.
     pub subreddit: Option<String>,
+    /// Permalink to the post.
     pub permalink: String,
+    /// Outbound URL of the post, if any.
     pub outbound_url: Option<String>,
+    /// Highlighted snippet of the best-matching text.
     pub snippet: String,
+    /// BM25 rank of the best match (lower sorts first).
     pub rank: f64,
     /// Which source produced the best-ranked match: `posts`, `capture`, or
     /// `enrichment`.
     pub source: String,
+    /// Timestamp the post was most recently seen during sync (RFC 3339).
     pub last_seen_at: String,
 }
 

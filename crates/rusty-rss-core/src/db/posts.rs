@@ -5,6 +5,13 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
+/// Insert a post, or update it if it already exists (keyed by `reddit_fullname`).
+///
+/// Atomic against concurrent writers: when the caller is not already in a
+/// transaction this takes an `IMMEDIATE` write lock so the existence check and
+/// write cannot race. Preserves `first_seen_at`, always advances `last_seen_at`,
+/// and reports whether the post was [`Inserted`](UpsertResult::Inserted),
+/// [`Updated`](UpsertResult::Updated), or [`Unchanged`](UpsertResult::Unchanged).
 pub fn upsert_post(conn: &Connection, post: &SavedPost) -> Result<UpsertResult> {
     let now = Utc::now().to_rfc3339();
 
@@ -152,13 +159,21 @@ impl ExistingPost {
     }
 }
 
+/// Outcome of an [`upsert_post`] call.
 #[derive(Debug, Clone, Copy)]
 pub enum UpsertResult {
+    /// The post did not exist and was inserted.
     Inserted,
+    /// The post existed and at least one field changed, so it was updated.
     Updated,
+    /// The post existed unchanged; only `last_seen_at` was touched.
     Unchanged,
 }
 
+/// List posts as lightweight rows for display, most-recently-seen first.
+///
+/// Paginated by `limit`/`offset`, with a deterministic `reddit_fullname`
+/// tiebreaker for tied timestamps.
 pub fn list_posts(conn: &Connection, limit: usize, offset: usize) -> Result<Vec<SavedPostRow>> {
     let mut stmt = conn.prepare(
         "SELECT reddit_fullname, title, author, subreddit, permalink, published_at, last_seen_at
@@ -185,17 +200,26 @@ pub fn list_posts(conn: &Connection, limit: usize, offset: usize) -> Result<Vec<
         .context("failed to collect posts")
 }
 
+/// A summary row for a saved post, suitable for list views and serialization.
 #[derive(Debug, serde::Serialize)]
 pub struct SavedPostRow {
+    /// Reddit fullname (stable identifier) of the post.
     pub fullname: String,
+    /// Post title.
     pub title: String,
+    /// Post author, if known.
     pub author: Option<String>,
+    /// Subreddit the post belongs to, if known.
     pub subreddit: Option<String>,
+    /// Permalink to the post.
     pub permalink: String,
+    /// Original publication timestamp (RFC 3339), if known.
     pub published_at: Option<String>,
+    /// Timestamp the post was most recently seen during sync (RFC 3339).
     pub last_seen_at: String,
 }
 
+/// Fetch a single post by its Reddit fullname, or `None` if it does not exist.
 pub fn get_post(conn: &Connection, fullname: &str) -> Result<Option<SavedPost>> {
     let row = conn
         .query_row(
@@ -229,6 +253,7 @@ pub fn get_post(conn: &Connection, fullname: &str) -> Result<Option<SavedPost>> 
     }
 }
 
+/// Return the total number of saved posts in the database.
 pub fn count_posts(conn: &Connection) -> Result<usize> {
     conn.query_row("SELECT COUNT(*) FROM saved_posts", [], |row| {
         row.get::<_, usize>(0)

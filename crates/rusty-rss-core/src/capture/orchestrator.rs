@@ -12,6 +12,14 @@ use tokio::task::JoinSet;
 
 const CAPTURE_USER_AGENT: &str = "rusty-rss/0.1";
 
+/// Capture outbound metadata for the pending candidate posts and persist it.
+///
+/// Selects up to `options.limit` posts that have an outbound URL but no recent
+/// capture, fetches them concurrently (bounded by `options.max_concurrency`,
+/// with per-URL retries), and upserts each result -- success or error -- into
+/// the database. Always builds the guarded HTTP client internally so SSRF
+/// protections cannot be bypassed by the caller. Returns a [`CaptureSummary`]
+/// of the run.
 pub async fn capture_outbound_metadata(
     conn: &Connection,
     options: CaptureOptions,

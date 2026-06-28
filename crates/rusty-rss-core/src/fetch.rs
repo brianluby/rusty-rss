@@ -1,3 +1,6 @@
+//! Feed HTTP fetching: retrying GET with timeouts, content-type validation, and
+//! secret-redacting error handling.
+
 use crate::config::{redact_error, redact_feed_url};
 use anyhow::{Context, Result, anyhow};
 use reqwest::Client;
@@ -6,6 +9,11 @@ use std::time::Duration;
 const TIMEOUT_SECS: u64 = 30;
 const MAX_RETRIES: u32 = 3;
 
+/// Fetch the feed at `url`, retrying transient failures with backoff.
+///
+/// Returns the response body as a string on success. Validates the response
+/// status and content type, and scrubs the feed token/user from any error or log
+/// output. Returns an error after all retries are exhausted.
 pub async fn fetch_feed(client: &Client, url: &str) -> Result<String> {
     let mut last_err = None;
 
@@ -77,6 +85,7 @@ fn is_acceptable_content_type(ct: &str) -> bool {
         || lower.contains("text/plain")
 }
 
+/// Build the HTTP client used for feed fetching, configured with `user_agent`.
 pub fn build_http_client(user_agent: &str) -> Client {
     Client::builder()
         .user_agent(user_agent)

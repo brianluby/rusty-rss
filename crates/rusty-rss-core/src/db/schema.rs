@@ -12,6 +12,12 @@ use std::time::Duration;
 
 use super::migrations;
 
+/// Open (creating if absent) the SQLite database and bring it fully online.
+///
+/// Configures the connection (busy timeout, foreign-key enforcement), applies
+/// any pending schema/data migrations transactionally, and repairs any drifted
+/// full-text-search index. Safe to call on every startup; it is idempotent on an
+/// up-to-date database. Returns the ready-to-use [`Connection`].
 pub fn init_db(db_path: &Path) -> Result<Connection> {
     let mut conn = Connection::open(db_path)
         .context(format!("failed to open database at {}", db_path.display()))?;
