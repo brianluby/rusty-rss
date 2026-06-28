@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC2034 # Variables set in parse_args, used in later tasks
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -30,7 +29,7 @@ default_db_path() {
   printf '%s/rusty-rss/rusty-rss.sqlite3' "${XDG_DATA_HOME:-$HOME/.local/share}"
 }
 
-BINARIES=(rusty-rss rusty-rss-mcp)
+readonly BINARIES=(rusty-rss rusty-rss-mcp)
 
 build_workspace() {
   command -v cargo >/dev/null 2>&1 \
@@ -79,7 +78,7 @@ write_config() {
 
   if [ -f "$env_path" ]; then
     local existing
-    existing="$(sed -n 's/^RUSTY_RSS_FEED_URL=//p' "$env_path" | head -1)"
+    existing="$(sed -n "s/^RUSTY_RSS_FEED_URL='\(.*\)'\$/\1/p" "$env_path" | head -1)"
     if [ -n "$existing" ]; then
       log "Existing feed URL: $(redact_url "$existing")"
     fi
@@ -111,13 +110,15 @@ write_config() {
 
   mkdir -p "$cfg_dir"; chmod 700 "$cfg_dir"
   mkdir -p "$(dirname "$DB_PATH")"
+  local esc_feed="${feed_url//\'/\'\\\'\'}"
+  local esc_db="${DB_PATH//\'/\'\\\'\'}"
   (
     umask 077
     cat > "$env_path" <<EOF
 # rusty-rss configuration. Loaded with:
 #   set -a; source $env_path; set +a
-RUSTY_RSS_FEED_URL=$feed_url
-RUSTY_RSS_DB_PATH=$DB_PATH
+RUSTY_RSS_FEED_URL='$esc_feed'
+RUSTY_RSS_DB_PATH='$esc_db'
 EOF
   )
   chmod 600 "$env_path"
