@@ -11,7 +11,6 @@ pub(crate) mod prompt;
 use self::prompt::ChatMessage;
 use crate::models::{EnrichmentOutput, SavedPost};
 use reqwest::Client;
-use schemars::schema_for;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::future::Future;
@@ -335,12 +334,65 @@ fn parse_enrichment_output(raw_response: &str) -> std::result::Result<Enrichment
 }
 
 fn response_format_schema() -> Value {
+    // OpenAI's strict structured-output validator accepts only a subset of JSON
+    // Schema. The `schemars` output for Rust enums uses `oneOf`, which local
+    // llama.cpp accepts but OpenAI rejects with "'oneOf' is not permitted".
+    // Keep this schema deliberately flat and explicit so it works across both
+    // OpenAI and OpenAI-compatible local servers.
     json!({
         "type": "json_schema",
         "json_schema": {
             "name": "rusty_rss_enrichment",
             "strict": true,
-            "schema": schema_for!(EnrichmentOutput)
+            "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                    "classification",
+                    "tags",
+                    "summary",
+                    "joy_value",
+                    "work_value",
+                    "recommended_action",
+                    "rationale",
+                    "confidence"
+                ],
+                "properties": {
+                    "classification": {
+                        "type": "string",
+                        "enum": [
+                            "article",
+                            "tool",
+                            "tutorial",
+                            "reference",
+                            "discussion",
+                            "question",
+                            "news",
+                            "other"
+                        ]
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    },
+                    "summary": { "type": "string" },
+                    "joy_value": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                    "work_value": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                    "recommended_action": {
+                        "type": "string",
+                        "enum": [
+                            "should_test",
+                            "should_build",
+                            "reading_queue",
+                            "reference_only",
+                            "discard",
+                            "other"
+                        ]
+                    },
+                    "rationale": { "type": "string" },
+                    "confidence": { "type": "number", "minimum": 0.0, "maximum": 1.0 }
+                }
+            }
         }
     })
 }
@@ -378,6 +430,20 @@ mod tests {
         )
         .expect("config should build");
         OpenAiProvider::new(config)
+    }
+
+    #[test]
+    fn response_format_schema_uses_openai_strict_subset() {
+        let schema = response_format_schema();
+        let rendered = serde_json::to_string(&schema).expect("schema should serialize");
+
+        assert!(rendered.contains("\"type\":\"json_schema\""));
+        assert!(rendered.contains("\"additionalProperties\":false"));
+        assert!(rendered.contains("\"enum\":[\"article\",\"tool\""));
+        assert!(rendered.contains("\"enum\":[\"should_test\",\"should_build\""));
+        assert!(!rendered.contains("oneOf"));
+        assert!(!rendered.contains("anyOf"));
+        assert!(!rendered.contains("$ref"));
     }
 
     #[tokio::test]
