@@ -110,8 +110,11 @@ write_config() {
 
   mkdir -p "$cfg_dir"; chmod 700 "$cfg_dir"
   mkdir -p "$(dirname "$DB_PATH")"
-  local esc_feed="${feed_url//\'/\'\\\'\'}"
-  local esc_db="${DB_PATH//\'/\'\\\'\'}"
+  # Escape embedded single quotes as '\'' so the values are safe inside the
+  # single-quoted env-file lines below. Unquoted on the assignment RHS so the
+  # replacement's backslashes are processed correctly (double quotes would not).
+  local esc_feed=${feed_url//\'/\'\\\'\'}
+  local esc_db=${DB_PATH//\'/\'\\\'\'}
   (
     umask 077
     cat > "$env_path" <<EOF
