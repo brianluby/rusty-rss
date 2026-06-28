@@ -125,6 +125,27 @@ EOF
   printf '    set -a; source %s; set +a\n' "$env_path"
 }
 
+register_mcp() {
+  local mcp_bin="$PREFIX/rusty-rss-mcp"
+  if ! command -v claude >/dev/null 2>&1; then
+    log "Claude Code CLI not found. To register the MCP server later, run:"
+    printf '    claude mcp add rusty-rss -- %s --db-path %s\n' "$mcp_bin" "$DB_PATH"
+    return 0
+  fi
+  if claude mcp get rusty-rss >/dev/null 2>&1; then
+    confirm "MCP server 'rusty-rss' already registered. Re-add?" || {
+      log "Leaving existing MCP registration."
+      return 0
+    }
+    run claude mcp remove rusty-rss || true
+  fi
+  log "Registering MCP server with Claude Code"
+  if ! run claude mcp add rusty-rss -- "$mcp_bin" --db-path "$DB_PATH"; then
+    warn "claude mcp add failed; register manually with:"
+    printf '    claude mcp add rusty-rss -- %s --db-path %s\n' "$mcp_bin" "$DB_PATH"
+  fi
+}
+
 usage() {
   cat <<'EOF'
 install.sh - build and install rusty-rss
@@ -173,6 +194,7 @@ main() {
   build_workspace
   install_binaries
   [ "$DO_CONFIG" -eq 1 ] && write_config
+  [ "$DO_MCP" -eq 1 ] && register_mcp
 }
 
 main "$@"
