@@ -41,7 +41,17 @@ pub fn list_enrichment_candidates(
     // comparison. A `None` window binds SQL NULL and disables the age check.
     let cutoff = stale_after.map(|window| {
         let secs = i64::try_from(window.as_secs()).unwrap_or(i64::MAX);
-        (Utc::now() - chrono::Duration::seconds(secs)).to_rfc3339()
+        // `chrono::Duration::try_seconds` returns None when `secs` overflows
+        // chrono's internal millisecond range, and `checked_sub_signed` returns
+        // None if the subtraction underflows the representable DateTime range.
+        // In either case the window is effectively infinite, which correctly
+        // means "no run is old enough to be stale": clamp the cutoff to the
+        // minimum representable instant so the `created_at >= cutoff` predicate
+        // matches every existing successful run (nothing gets reselected as stale).
+        chrono::Duration::try_seconds(secs)
+            .and_then(|delta| Utc::now().checked_sub_signed(delta))
+            .unwrap_or(chrono::DateTime::<Utc>::MIN_UTC)
+            .to_rfc3339()
     });
 
     let mut stmt = conn.prepare(
@@ -530,6 +540,39 @@ mod tests {
         assert!(
             stale_names.contains("t3_fresh"),
             "zero window makes current runs stale"
+        );
+    }
+
+    #[test]
+    fn candidate_selection_handles_overflowing_staleness_window() {
+        // An effectively-infinite staleness window (u64::MAX seconds) overflows
+        // chrono's millisecond representation; the cutoff must clamp instead of
+        // panicking. An infinite window means "nothing is old enough to be
+        // stale", so a post with a current-prompt success run is NOT reselected.
+        let conn = test_db();
+        let post = test_post();
+        upsert_post(&conn, &post).expect("post should insert");
+        record_enrichment_success(
+            &conn,
+            "t3_test123",
+            "provider",
+            "model",
+            "prompt-v2",
+            "raw",
+            &test_output(RecommendedAction::ReadingQueue, "fresh"),
+        )
+        .expect("enrichment should insert");
+
+        let candidates =
+            list_enrichment_candidates(&conn, 10, "prompt-v2", Some(Duration::from_secs(u64::MAX)))
+                .expect("candidates should query without panicking");
+        let names: std::collections::HashSet<_> = candidates
+            .iter()
+            .map(|p| p.reddit_fullname.clone())
+            .collect();
+        assert!(
+            !names.contains("t3_test123"),
+            "an infinite window means nothing is stale: a current-prompt run must not reselect"
         );
     }
 

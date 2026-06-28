@@ -71,7 +71,8 @@ pub(super) fn enrich_options(
     EnrichOptions {
         concurrency,
         retry_attempts,
-        stale_after: stale_after_days.map(|days| Duration::from_secs(days * 24 * 60 * 60)),
+        stale_after: stale_after_days
+            .map(|days| Duration::from_secs(days.saturating_mul(24 * 60 * 60))),
         ..EnrichOptions::new(limit, dry_run)
     }
 }
@@ -113,5 +114,14 @@ mod tests {
 
         let none = enrich_options(1, false, 1, 1, None);
         assert_eq!(none.stale_after, None);
+    }
+
+    #[test]
+    fn enrich_options_saturates_overflowing_staleness_window() {
+        // A huge --stale-after-days must saturate to u64::MAX seconds rather
+        // than overflowing the `days * 24 * 60 * 60` multiplication (which panics
+        // in debug builds).
+        let opts = enrich_options(1, false, 1, 1, Some(u64::MAX));
+        assert_eq!(opts.stale_after, Some(Duration::from_secs(u64::MAX)));
     }
 }
