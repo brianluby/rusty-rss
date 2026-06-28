@@ -30,6 +30,32 @@ default_db_path() {
   printf '%s/rusty-rss/rusty-rss.sqlite3' "${XDG_DATA_HOME:-$HOME/.local/share}"
 }
 
+BINARIES=(rusty-rss rusty-rss-mcp)
+
+build_workspace() {
+  command -v cargo >/dev/null 2>&1 \
+    || die "cargo not found. Install Rust from https://rustup.rs and re-run."
+  log "Building release binaries"
+  run cargo build --release --bins --manifest-path "$SCRIPT_DIR/Cargo.toml"
+}
+
+path_has_dir() {
+  case ":$PATH:" in *":$1:"*) return 0 ;; *) return 1 ;; esac
+}
+
+install_binaries() {
+  log "Installing binaries to $PREFIX"
+  run mkdir -p "$PREFIX"
+  local bin
+  for bin in "${BINARIES[@]}"; do
+    run install -m 755 "$SCRIPT_DIR/target/release/$bin" "$PREFIX/$bin"
+  done
+  if ! path_has_dir "$PREFIX"; then
+    warn "$PREFIX is not on your PATH. Add this to your shell rc:"
+    printf "    export PATH=\"%s:\$PATH\"\n" "$PREFIX"
+  fi
+}
+
 usage() {
   cat <<'EOF'
 install.sh - build and install rusty-rss
@@ -71,6 +97,12 @@ parse_args() {
 main() {
   parse_args "$@"
   log "rusty-rss installer (action: $ACTION, dry-run: $DRY_RUN)"
+  if [ "$ACTION" = "uninstall" ]; then
+    log "uninstall not yet implemented"
+    return 0
+  fi
+  build_workspace
+  install_binaries
 }
 
 main "$@"
