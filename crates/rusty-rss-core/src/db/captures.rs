@@ -5,29 +5,52 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, params};
 
+/// A post that has an outbound URL still pending (or due for re-)capture.
 #[derive(Debug, Clone)]
 pub struct OutboundCaptureCandidate {
+    /// Reddit fullname of the post owning the URL.
     pub reddit_fullname: String,
+    /// Outbound URL to capture.
     pub outbound_url: String,
 }
 
+/// Input record for upserting the result of an outbound capture attempt.
 #[derive(Debug, Clone)]
 pub struct OutboundCaptureUpsert {
+    /// Reddit fullname of the post this capture belongs to (conflict key).
     pub reddit_fullname: String,
+    /// Outbound URL that was requested.
     pub original_url: String,
+    /// Final URL after resolution, if the fetch succeeded.
     pub final_url: Option<String>,
+    /// Canonical URL declared by the page, if any.
     pub canonical_url: Option<String>,
+    /// Extracted page title, if any.
     pub title: Option<String>,
+    /// Extracted page description, if any.
     pub description: Option<String>,
+    /// Extracted site name, if any.
     pub site_name: Option<String>,
+    /// Extracted preview image URL, if any.
     pub preview_image_url: Option<String>,
+    /// Markdown snapshot of the page body, if any.
     pub content_markdown: Option<String>,
+    /// `sha256:`-prefixed hash of the markdown content, if any.
     pub content_hash: Option<String>,
+    /// Outcome status, e.g. `"success"` or `"error"`.
     pub status: String,
+    /// HTTP status code of the response, if one was received.
     pub http_status: Option<i64>,
+    /// Error message when the capture failed.
     pub error: Option<String>,
 }
 
+/// List posts with an outbound URL that has no successful, up-to-date capture.
+///
+/// Returns up to `limit` candidates ordered by most recently seen. A post is a
+/// candidate when it has never been captured, its last capture failed, or its
+/// outbound URL changed since the last capture. Returns an empty vector when
+/// `limit` is 0.
 pub fn list_outbound_capture_candidates(
     conn: &Connection,
     limit: usize,
@@ -63,6 +86,10 @@ pub fn list_outbound_capture_candidates(
         .context("failed to collect outbound capture candidates")
 }
 
+/// Insert or update the capture row for a post (keyed by `reddit_fullname`).
+///
+/// On conflict the existing row is overwritten with the new values and its
+/// `attempt_count` is incremented, recording each capture attempt.
 pub fn upsert_outbound_capture(conn: &Connection, capture: &OutboundCaptureUpsert) -> Result<()> {
     conn.execute(
         r#"INSERT INTO outbound_captures (
@@ -107,6 +134,7 @@ pub fn upsert_outbound_capture(conn: &Connection, capture: &OutboundCaptureUpser
     Ok(())
 }
 
+/// Fetch the stored capture for a post, or `None` if it has never been captured.
 pub fn latest_outbound_capture(
     conn: &Connection,
     reddit_fullname: &str,

@@ -38,6 +38,13 @@ impl CaptureClient {
     }
 }
 
+/// Build a [`CaptureClient`] with SSRF protections wired in.
+///
+/// Installs the DNS-rebinding-safe [`GuardedResolver`] seeded with
+/// `allow_private_hosts`, disables redirects, and ignores ambient proxy settings
+/// so requests cannot be tunnelled around the resolver. The `allow_private_hosts`
+/// policy is baked into the returned client and used as the single source of
+/// truth for both connection-time and pre-check validation.
 pub fn build_capture_client(user_agent: &str, allow_private_hosts: bool) -> CaptureClient {
     let client = Client::builder()
         .user_agent(user_agent)

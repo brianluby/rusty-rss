@@ -8,8 +8,11 @@ use std::collections::{BTreeMap, HashSet};
 /// A post in scope for Gate 1 tagging: just the fields the evaluator needs.
 #[derive(Debug, Clone)]
 pub struct TaggablePost {
+    /// SQLite rowid of the post, used to intersect with FTS match results.
     pub rowid: i64,
+    /// Reddit fullname identifying the post.
     pub reddit_fullname: String,
+    /// Subreddit the post belongs to, if known.
     pub subreddit: Option<String>,
 }
 

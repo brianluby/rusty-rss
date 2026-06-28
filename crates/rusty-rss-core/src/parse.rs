@@ -1,16 +1,29 @@
+//! Atom feed parsing: turn a feed body into normalized [`SavedPost`]s, collecting
+//! per-entry errors rather than failing the whole feed.
+
 use crate::models::SavedPost;
 use anyhow::{Context, Result, anyhow};
 use scraper::{Html, Selector};
 use std::io::Cursor;
 
+/// The outcome of parsing one feed page: the posts that parsed plus diagnostics.
 #[derive(Debug, Default)]
 pub struct ParsedFeed {
+    /// Posts successfully parsed from the feed.
     pub posts: Vec<SavedPost>,
+    /// Per-entry parse errors that did not abort the overall parse.
     pub errors: Vec<String>,
+    /// Total number of entries seen, including those that failed to parse.
     pub entry_count: usize,
+    /// Id of the last entry seen, used as the pagination cursor.
     pub last_entry_id: Option<String>,
 }
 
+/// Parse an Atom feed body into a [`ParsedFeed`].
+///
+/// Returns an error only if the feed itself cannot be parsed; individual entries
+/// that fail are collected into [`ParsedFeed::errors`] so a single bad entry does
+/// not drop the rest of the page.
 pub fn parse_atom(body: &str) -> Result<ParsedFeed> {
     let feed = feed_rs::parser::parse(Cursor::new(body)).context("failed to parse Atom feed")?;
 

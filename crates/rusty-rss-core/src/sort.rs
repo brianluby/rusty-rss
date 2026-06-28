@@ -12,10 +12,15 @@ use crate::models::{Classification, EnrichmentOutput, RecommendedAction};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum List {
+    /// Tools/techniques worth trying hands-on.
     ShouldTest,
+    /// Items to implement or build a project from.
     ShouldBuild,
+    /// Items worth reading in full later.
     ReadingQueue,
+    /// Items to keep for future lookup.
     Reference,
+    /// Low-value items to drop.
     Discard,
 }
 

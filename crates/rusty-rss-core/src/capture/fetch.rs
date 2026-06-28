@@ -11,6 +11,15 @@ use url::Url;
 const TIMEOUT_SECS: u64 = 20;
 const MAX_CAPTURE_BYTES: u64 = 1024 * 1024;
 
+/// Fetch a single URL and extract its page metadata.
+///
+/// Re-validates the URL against the client's private-host policy before
+/// connecting (defense in depth alongside the client's guarded resolver), then
+/// downloads the HTML, enforces a content-type and size cap, and extracts title,
+/// description, canonical URL, preview image, and a markdown snapshot.
+///
+/// Returns an error if the URL is blocked, the response is non-HTML, too large,
+/// or the request fails.
 pub async fn capture_url(client: &CaptureClient, url: &str) -> Result<CapturedMetadata> {
     validate_capture_url(url, client.allow_private_hosts()).await?;
     do_capture_url(client, url).await
