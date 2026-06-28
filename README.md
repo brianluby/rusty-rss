@@ -12,7 +12,9 @@ This builds release binaries, installs `rusty-rss` and `rusty-rss-mcp` to
 `~/.local/bin`, writes a secured config file at `~/.config/rusty-rss/env`
 (prompting for your feed URL with hidden input), and registers the MCP server
 with Claude Code. Re-running is safe. Useful flags: `--prefix DIR`,
-`--db-path PATH`, `--no-config`, `--no-mcp`, `-y`, `--uninstall`, `--dry-run`.
+`--db-path PATH`, `--no-config`, `--no-mcp`, `-y`, `--dry-run`, and
+`--uninstall` (add `--purge` to also remove the config file and database,
+which `--uninstall` otherwise leaves in place).
 
 Load your config in a shell before running `sync`:
 
