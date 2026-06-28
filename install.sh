@@ -36,7 +36,7 @@ build_workspace() {
   command -v cargo >/dev/null 2>&1 \
     || die "cargo not found. Install Rust from https://rustup.rs and re-run."
   log "Building release binaries"
-  run cargo build --release --bins --manifest-path "$SCRIPT_DIR/Cargo.toml"
+  run cargo build --release --workspace --manifest-path "$SCRIPT_DIR/Cargo.toml"
 }
 
 path_has_dir() {
