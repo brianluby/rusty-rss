@@ -132,6 +132,11 @@ register_mcp() {
     printf '    claude mcp add rusty-rss -- %s --db-path %s\n' "$mcp_bin" "$DB_PATH"
     return 0
   fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    log "Would register MCP server with Claude Code:"
+    printf '    claude mcp add rusty-rss -- %s --db-path %s\n' "$mcp_bin" "$DB_PATH"
+    return 0
+  fi
   if claude mcp get rusty-rss >/dev/null 2>&1; then
     confirm "MCP server 'rusty-rss' already registered. Re-add?" || {
       log "Leaving existing MCP registration."
@@ -193,8 +198,8 @@ main() {
   fi
   build_workspace
   install_binaries
-  [ "$DO_CONFIG" -eq 1 ] && write_config
-  [ "$DO_MCP" -eq 1 ] && register_mcp
+  if [ "$DO_CONFIG" -eq 1 ]; then write_config; fi
+  if [ "$DO_MCP" -eq 1 ]; then register_mcp; fi
 }
 
 main "$@"
