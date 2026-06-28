@@ -59,7 +59,7 @@ install_binaries() {
 # Reduce a URL to scheme://host/path, dropping userinfo, query, and fragment.
 redact_url() {
   # shellcheck disable=SC2001
-  printf '%s' "$1" | sed -E 's#^([a-zA-Z]+://[^/?#]*)(/[^?#]*)?.*#\1\2#'
+  printf '%s' "$1" | sed -E 's#^([a-zA-Z]+://)([^@/?#]*@)?([^/?#]*)(/[^?#]*)?.*#\1\3\4#'
 }
 
 # Prompt "question [y/N]"; return 0 for yes. Auto-yes when ASSUME_YES=1.
@@ -99,6 +99,9 @@ write_config() {
     http://*|https://*) ;;
     *) die "feed URL must start with http:// or https://" ;;
   esac
+  case "$feed_url" in
+    *[[:space:]]*) die "feed URL must not contain whitespace" ;;
+  esac
 
   if [ "$DRY_RUN" -eq 1 ]; then
     printf '    write %s (RUSTY_RSS_FEED_URL=%s, RUSTY_RSS_DB_PATH=%s)\n' \
@@ -108,13 +111,15 @@ write_config() {
 
   mkdir -p "$cfg_dir"; chmod 700 "$cfg_dir"
   mkdir -p "$(dirname "$DB_PATH")"
-  umask 077
-  cat > "$env_path" <<EOF
+  (
+    umask 077
+    cat > "$env_path" <<EOF
 # rusty-rss configuration. Loaded with:
 #   set -a; source $env_path; set +a
 RUSTY_RSS_FEED_URL=$feed_url
 RUSTY_RSS_DB_PATH=$DB_PATH
 EOF
+  )
   chmod 600 "$env_path"
   log "Wrote $env_path (mode 600). Load it with:"
   printf '    set -a; source %s; set +a\n' "$env_path"
