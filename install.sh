@@ -151,6 +151,24 @@ register_mcp() {
   fi
 }
 
+do_uninstall() {
+  log "Removing binaries from $PREFIX"
+  local bin
+  for bin in "${BINARIES[@]}"; do
+    [ -e "$PREFIX/$bin" ] && run rm -f "$PREFIX/$bin"
+  done
+  if command -v claude >/dev/null 2>&1 && claude mcp get rusty-rss >/dev/null 2>&1; then
+    run claude mcp remove rusty-rss || true
+  fi
+  if [ "$PURGE" -eq 1 ]; then
+    log "Purging config and database"
+    run rm -rf "$(config_dir)"
+    run rm -f "$DB_PATH"
+  else
+    log "Left config dir $(config_dir) and database in place (use --purge to remove)."
+  fi
+}
+
 usage() {
   cat <<'EOF'
 install.sh - build and install rusty-rss
@@ -193,7 +211,7 @@ main() {
   parse_args "$@"
   log "rusty-rss installer (action: $ACTION, dry-run: $DRY_RUN)"
   if [ "$ACTION" = "uninstall" ]; then
-    log "uninstall not yet implemented"
+    do_uninstall
     return 0
   fi
   build_workspace
