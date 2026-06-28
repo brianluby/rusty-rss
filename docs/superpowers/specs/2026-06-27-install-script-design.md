@@ -35,8 +35,8 @@ safe to re-run.
   created). Override with `--db-path PATH`. An installed tool must not write into
   `$PWD`.
 - Prompt for the feed URL using hidden input (`read -rs`) so the embedded Reddit
-  `feed` token never reaches the terminal echo or shell history. Validate it
-  begins with `http`.
+  `feed` token never reaches the terminal echo or shell history. Validate that it
+  begins with `http://` or `https://` (and rejects whitespace).
 - Write `RUSTY_RSS_FEED_URL=...` and `RUSTY_RSS_DB_PATH=...` to the env file.
 - If the env file already exists, display its contents with the feed URL reduced
   to `scheme://host/path` (mirroring `redact_feed_url` in the Rust core) and ask

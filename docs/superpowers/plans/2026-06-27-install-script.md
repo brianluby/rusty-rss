@@ -479,7 +479,7 @@ git commit -m "feat: uninstall and purge support"
 
 Insert before the existing `## Quick Start` heading:
 
-```markdown
+````markdown
 ## Install
 
 ```bash
@@ -498,7 +498,7 @@ Load your config in a shell before running `sync`:
 set -a; source ~/.config/rusty-rss/env; set +a
 rusty-rss sync
 ```
-```
+````
 
 - [ ] **Step 2: Verify rendering**
 

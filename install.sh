@@ -2,6 +2,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Honor CARGO_TARGET_DIR so the build output and the install source agree even
+# when the user (or CI) redirects Cargo's target directory.
+TARGET_DIR="${CARGO_TARGET_DIR:-$SCRIPT_DIR/target}"
 PREFIX="$HOME/.local/bin"
 DB_PATH=""
 DO_CONFIG=1
@@ -23,6 +26,9 @@ run() {
   fi
 }
 
+# Quote a string so it is safe to copy/paste into a shell (handles spaces/quotes).
+shq() { printf '%q' "$1"; }
+
 config_dir() { printf '%s/rusty-rss' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
 env_file()   { printf '%s/env' "$(config_dir)"; }
 default_db_path() {
@@ -35,7 +41,7 @@ build_workspace() {
   command -v cargo >/dev/null 2>&1 \
     || die "cargo not found. Install Rust from https://rustup.rs and re-run."
   log "Building release binaries"
-  run cargo build --release --workspace --manifest-path "$SCRIPT_DIR/Cargo.toml"
+  run cargo build --release --workspace --target-dir "$TARGET_DIR" --manifest-path "$SCRIPT_DIR/Cargo.toml"
 }
 
 path_has_dir() {
@@ -47,7 +53,7 @@ install_binaries() {
   run mkdir -p "$PREFIX"
   local bin
   for bin in "${BINARIES[@]}"; do
-    run install -m 755 "$SCRIPT_DIR/target/release/$bin" "$PREFIX/$bin"
+    run install -m 755 "$TARGET_DIR/release/$bin" "$PREFIX/$bin"
   done
   if ! path_has_dir "$PREFIX"; then
     warn "$PREFIX is not on your PATH. Add this to your shell rc:"
@@ -104,7 +110,7 @@ write_config() {
 
   if [ "$DRY_RUN" -eq 1 ]; then
     printf '    write %s (RUSTY_RSS_FEED_URL=%s, RUSTY_RSS_DB_PATH=%s)\n' \
-      "$env_path" "$(redact_url "$feed_url")" "$DB_PATH"
+      "$(shq "$env_path")" "$(redact_url "$feed_url")" "$(shq "$DB_PATH")"
     return 0
   fi
 
@@ -126,19 +132,19 @@ EOF
   )
   chmod 600 "$env_path"
   log "Wrote $env_path (mode 600). Load it with:"
-  printf '    set -a; source %s; set +a\n' "$env_path"
+  printf '    set -a; source %s; set +a\n' "$(shq "$env_path")"
 }
 
 register_mcp() {
   local mcp_bin="$PREFIX/rusty-rss-mcp"
   if ! command -v claude >/dev/null 2>&1; then
     log "Claude Code CLI not found. To register the MCP server later, run:"
-    printf '    claude mcp add rusty-rss -- %s --db-path %s\n' "$mcp_bin" "$DB_PATH"
+    printf '    claude mcp add rusty-rss -- %s --db-path %s\n' "$(shq "$mcp_bin")" "$(shq "$DB_PATH")"
     return 0
   fi
   if [ "$DRY_RUN" -eq 1 ]; then
     log "Would register MCP server with Claude Code:"
-    printf '    claude mcp add rusty-rss -- %s --db-path %s\n' "$mcp_bin" "$DB_PATH"
+    printf '    claude mcp add rusty-rss -- %s --db-path %s\n' "$(shq "$mcp_bin")" "$(shq "$DB_PATH")"
     return 0
   fi
   if claude mcp get rusty-rss >/dev/null 2>&1; then
@@ -151,7 +157,7 @@ register_mcp() {
   log "Registering MCP server with Claude Code"
   if ! run claude mcp add rusty-rss -- "$mcp_bin" --db-path "$DB_PATH"; then
     warn "claude mcp add failed; register manually with:"
-    printf '    claude mcp add rusty-rss -- %s --db-path %s\n' "$mcp_bin" "$DB_PATH"
+    printf '    claude mcp add rusty-rss -- %s --db-path %s\n' "$(shq "$mcp_bin")" "$(shq "$DB_PATH")"
   fi
 }
 
@@ -166,8 +172,18 @@ do_uninstall() {
   fi
   if [ "$PURGE" -eq 1 ]; then
     log "Purging config and database"
+    # Prefer the DB path actually recorded in the config file, so a database
+    # installed under a custom --db-path is removed rather than silently left
+    # behind. Read it before the config dir is deleted.
+    local db_to_remove env_path cfg_db
+    db_to_remove="$DB_PATH"
+    env_path="$(env_file)"
+    if [ -f "$env_path" ]; then
+      cfg_db="$(sed -n "s/^RUSTY_RSS_DB_PATH='\(.*\)'\$/\1/p" "$env_path" | head -1)"
+      [ -n "$cfg_db" ] && db_to_remove="$cfg_db"
+    fi
+    run rm -f "$db_to_remove"
     run rm -rf "$(config_dir)"
-    run rm -f "$DB_PATH"
   else
     log "Left config dir $(config_dir) and database in place (use --purge to remove)."
   fi
@@ -209,6 +225,9 @@ parse_args() {
     esac
   done
   [ -n "$DB_PATH" ] || DB_PATH="$(default_db_path)"
+  if [ "$PURGE" -eq 1 ] && [ "$ACTION" != "uninstall" ]; then
+    die "--purge is only valid with --uninstall"
+  fi
 }
 
 main() {

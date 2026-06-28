@@ -10,6 +10,8 @@
 
 This builds release binaries, installs `rusty-rss` and `rusty-rss-mcp` to
 `~/.local/bin`, writes a secured config file at `~/.config/rusty-rss/env`
+(or `$XDG_CONFIG_HOME/rusty-rss/env` when `XDG_CONFIG_HOME` is set; the script
+prints the exact path it used)
 (prompting for your feed URL with hidden input), and registers the MCP server
 with Claude Code. Re-running is safe. Useful flags: `--prefix DIR`,
 `--db-path PATH`, `--no-config`, `--no-mcp`, `-y`, `--dry-run`, and
