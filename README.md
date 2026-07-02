@@ -2,6 +2,29 @@
 
 `rusty-rss` turns a Reddit saved-items RSS or Atom feed into a local SQLite archive. It can sync saved posts, search titles and Markdown content, enrich items with an OpenAI-compatible LLM, capture outbound page metadata, tag posts by topic with a token-free rule engine, export agent-ready records, and expose read-only MCP tools.
 
+## Install
+
+```bash
+./install.sh
+```
+
+This builds release binaries, installs `rusty-rss` and `rusty-rss-mcp` to
+`~/.local/bin`, writes a secured config file at `~/.config/rusty-rss/env`
+(or `$XDG_CONFIG_HOME/rusty-rss/env` when `XDG_CONFIG_HOME` is set; the script
+prints the exact path it used)
+(prompting for your feed URL with hidden input), and registers the MCP server
+with Claude Code. Re-running is safe. Useful flags: `--prefix DIR`,
+`--db-path PATH`, `--no-config`, `--no-mcp`, `-y`, `--dry-run`, and
+`--uninstall` (add `--purge` to also remove the config file and database,
+which `--uninstall` otherwise leaves in place).
+
+Load your config in a shell before running `sync`:
+
+```bash
+set -a; source ~/.config/rusty-rss/env; set +a
+rusty-rss sync
+```
+
 ## Quick Start
 
 ```bash
