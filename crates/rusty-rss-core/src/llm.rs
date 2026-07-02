@@ -376,8 +376,10 @@ fn response_format_schema() -> Value {
                         "items": { "type": "string" }
                     },
                     "summary": { "type": "string" },
-                    "joy_value": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
-                    "work_value": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                    // OpenAI strict structured outputs reject `minimum`/`maximum`;
+                    // `EnrichmentOutput::validate()` enforces the 0.0..=1.0 range.
+                    "joy_value": { "type": "number" },
+                    "work_value": { "type": "number" },
                     "recommended_action": {
                         "type": "string",
                         "enum": [
@@ -390,7 +392,7 @@ fn response_format_schema() -> Value {
                         ]
                     },
                     "rationale": { "type": "string" },
-                    "confidence": { "type": "number", "minimum": 0.0, "maximum": 1.0 }
+                    "confidence": { "type": "number" }
                 }
             }
         }
