@@ -29,7 +29,7 @@ identical results:
 
 1. `subreddit == "rust" && work_value >= 0.7` → `add_to_list("should_build")`
 2. `classification == "news" && age_days > 30` → `discard`
-3. `outbound_url != "" && joy_value > 0.5` → `add_to_list("reading_queue")`
+3. `has_outbound && joy_value > 0.5` → `add_to_list("reading_queue")`
 
 ## Decision
 
@@ -90,7 +90,8 @@ swappable trait exists precisely so that flip is cheap.
 >=`); boolean composition (`&& || !` and parentheses); field references from the
 `FieldRegistry` allow-list; a **fixed** helper set — `present(x)` (non-null /
 non-empty), `contains(haystack, needle)` (string/vec membership),
-`days_since(published_at)` (age in days, evaluated against the post clock).
+`days_since(published_at)` (age in days, evaluated against a clock injected at
+eval time so tests are deterministic — never bound to `Utc::now()` directly).
 
 **Excluded (CEL escalation triggers):** assignment, loops, recursion, function
 definition, general arithmetic, method calls, regex.
@@ -104,21 +105,21 @@ pathologically nested input.
 A flattened `RuleRecord` built from `SavedPost` (+ derived fields) and the latest
 `EnrichmentOutput`. `age_days` and `has_outbound` are derived at eval time.
 
-| field               | type            | source / notes                                   |
-| ------------------- | --------------- | ------------------------------------------------ |
-| `subreddit`         | Option\<String\> | `SavedPost.subreddit`                            |
-| `classification`    | String          | `EnrichmentOutput.classification` (snake_case)   |
-| `recommended_action`| String          | `EnrichmentOutput.recommended_action`            |
-| `joy_value`         | f32             | `EnrichmentOutput.joy_value`                     |
-| `work_value`        | f32             | `EnrichmentOutput.work_value`                    |
-| `confidence`        | f32             | `EnrichmentOutput.confidence`                    |
-| `tags`              | Vec\<String\>   | `EnrichmentOutput.tags`                          |
-| `summary`           | String          | `EnrichmentOutput.summary`                       |
-| `title`             | String          | `SavedPost.title`                                |
-| `outbound_url`      | Option\<String\> | `SavedPost.outbound_url`                         |
-| `has_outbound`      | bool            | derived: `outbound_url.is_some_and(non-empty)`   |
-| `age_days`          | f64             | derived: `now - SavedPost.published_at`          |
-| `source`            | String          | `SavedPost.source`                               |
+| field                | type             | source / notes                                                 |
+| -------------------- | ---------------- | -------------------------------------------------------------- |
+| `subreddit`          | Option\<String\> | `SavedPost.subreddit`                                          |
+| `classification`     | String           | `EnrichmentOutput.classification` (snake_case)                 |
+| `recommended_action` | String           | `EnrichmentOutput.recommended_action` (snake_case)             |
+| `joy_value`          | f32              | `EnrichmentOutput.joy_value`                                   |
+| `work_value`         | f32              | `EnrichmentOutput.work_value`                                  |
+| `confidence`         | f32              | `EnrichmentOutput.confidence`                                  |
+| `tags`               | Vec\<String\>    | `EnrichmentOutput.tags`                                        |
+| `summary`            | String           | `EnrichmentOutput.summary`                                     |
+| `title`              | String           | `SavedPost.title`                                              |
+| `outbound_url`       | Option\<String\> | `SavedPost.outbound_url`                                       |
+| `has_outbound`       | bool             | derived: `outbound_url` is `Some` and non-empty after trimming |
+| `age_days`           | f64              | derived: `now - SavedPost.published_at`                        |
+| `source`             | String           | `SavedPost.source`                                             |
 
 Out-of-range scores remain enforced by `EnrichmentOutput::validate()`
 (`models.rs:184`) regardless of rule output.
@@ -190,7 +191,7 @@ Throwaway prototype harness (not in-repo): four standalone crates (`baseline`,
 `cel-spike`, `regorus-spike`, `rhai-spike`), each parsing the same 3 JSON records
 and evaluating the 3 rules. All four produced identical output:
 
-```
+```text
 record 0: ["should_build"]
 record 1: ["discard"]
 record 2: ["reading_queue"]

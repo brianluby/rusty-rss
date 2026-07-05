@@ -94,9 +94,13 @@ rules.
   evaluate firing rules, produce an ordered, de-duplicated action plan. Idempotent
   (re-runs re-stamp provenance, not duplicate effects). **Dry-run is the default**;
   `--apply` mutates. No destructive action (e.g. `discard`) enabled by default.
-- **Provenance** — rows recording `rule_id`, `ruleset_version`, `action`, target,
-  timestamp, per fired rule (mirror the existing `post_tags` provenance model in
-  `db::tags.rs`).
+- **Provenance** — a **new** per-fired-rule table (e.g. `rule_firings`), **not**
+  an extension of `post_tags`. One row per firing: `post_fullname`, `rule_id`,
+  `ruleset_version`, `action`, `target`, `created_at`. The existing `post_tags`
+  model in `db::tags.rs` is *aggregate* (`matched_rules` / `signals` /
+  `ruleset_version` on one row per post/topic) and serves a different engine;
+  action rules need per-firing granularity, so model this as a separate table
+  added via a new migration in `db/migrations.rs`.
 - **CLI** — new top-level `rules` command with nested `run | test | validate |
   list`, JSON output (`--json`) for machine consumption. `run` defaults to
   dry-run; `test` evaluates a single record/condition for authoring feedback.
